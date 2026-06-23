@@ -1,0 +1,153 @@
+package tui
+
+import (
+	"path/filepath"
+	"strings"
+
+	"agentree/internal/orchestrator"
+	"agentree/internal/store"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// projects lists registered repositories and supports registering new ones by
+// path (press `a`). Registration validates the path is a git work tree.
+type projects struct {
+	store  *store.Store
+	theme  Theme
+	w, h   int
+	items  []store.Project
+	loaded bool
+
+	adding bool
+	input  textinput.Model
+	errMsg string
+}
+
+func newProjects(st *store.Store, th Theme) *projects {
+	ti := textinput.New()
+	ti.Placeholder = "/absolute/path/to/repo"
+	ti.Prompt = "repo path › "
+	return &projects{store: st, theme: th, input: ti}
+}
+
+type projectsLoadedMsg struct{ items []store.Project }
+type projectRegisteredMsg struct{ name string }
+
+func (p *projects) Init() tea.Cmd { return p.refresh() }
+
+func (p *projects) refresh() tea.Cmd {
+	return func() tea.Msg {
+		items, err := p.store.ListProjects(ctx())
+		if err != nil {
+			return errMsg{err}
+		}
+		return projectsLoadedMsg{items}
+	}
+}
+
+// register validates the path and inserts the project (idempotent).
+func (p *projects) register(path string) tea.Cmd {
+	return func() tea.Msg {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return errMsg{err}
+		}
+		name, branch, err := orchestrator.RepoInfo(ctx(), abs)
+		if err != nil {
+			return errMsg{err}
+		}
+		if _, err := p.store.GetOrCreateProject(ctx(), name, abs, branch); err != nil {
+			return errMsg{err}
+		}
+		return projectRegisteredMsg{name: name}
+	}
+}
+
+func (p *projects) Update(msg tea.Msg) (tab, tea.Cmd) {
+	switch msg := msg.(type) {
+	case projectsLoadedMsg:
+		p.items = msg.items
+		p.loaded = true
+		return p, nil
+	case projectRegisteredMsg:
+		p.adding = false
+		p.errMsg = ""
+		p.input.Reset()
+		p.input.Blur()
+		return p, p.refresh()
+	case errMsg:
+		if p.adding {
+			p.errMsg = msg.err.Error()
+		}
+		return p, nil
+	case tea.KeyMsg:
+		if p.adding {
+			switch msg.String() {
+			case "esc":
+				p.adding = false
+				p.errMsg = ""
+				p.input.Blur()
+				return p, nil
+			case "enter":
+				path := strings.TrimSpace(p.input.Value())
+				if path == "" {
+					return p, nil
+				}
+				return p, p.register(path)
+			}
+			var cmd tea.Cmd
+			p.input, cmd = p.input.Update(msg)
+			return p, cmd
+		}
+		switch msg.String() {
+		case "a":
+			p.adding = true
+			p.errMsg = ""
+			p.input.Focus()
+			return p, textinput.Blink
+		case "r":
+			return p, p.refresh()
+		}
+	}
+	return p, nil
+}
+
+func (p *projects) SetSize(w, h int) { p.w, p.h = w, h }
+
+func (p *projects) View() string {
+	var b strings.Builder
+	b.WriteString(p.theme.Title.Render("Registered projects"))
+	b.WriteString("\n\n")
+
+	if p.adding {
+		b.WriteString(p.input.View())
+		b.WriteString("\n")
+		if p.errMsg != "" {
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("✗ " + p.errMsg))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n" + p.theme.Help.Render("enter: register · esc: cancel"))
+		return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(b.String())
+	}
+
+	if !p.loaded {
+		b.WriteString(p.theme.Subtle.Render("loading…"))
+	} else if len(p.items) == 0 {
+		b.WriteString(p.theme.Subtle.Render("No projects registered yet."))
+	} else {
+		for _, it := range p.items {
+			b.WriteString(p.theme.Accent.Render(it.Name))
+			b.WriteString("  ")
+			b.WriteString(p.theme.Subtle.Render(it.RepoPath + "  (" + it.DefaultBranch + ")"))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n" + p.theme.Help.Render("a: add project · r: refresh"))
+	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(b.String())
+}
+
+// CapturingInput implements tab; true only while entering a repo path.
+func (p *projects) CapturingInput() bool { return p.adding }

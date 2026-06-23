@@ -1,0 +1,19 @@
+# Binaries
+/agentree
+/bin/
+*.exe
+
+# Local databases / state
+*.db
+*.db-wal
+*.db-shm
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
