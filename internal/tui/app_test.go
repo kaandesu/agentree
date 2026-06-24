@@ -13,22 +13,76 @@ import (
 )
 
 // TestModelRenders verifies the root model wires up, processes a window size,
-// drains the tabs' initial load commands, and renders the tab bar + content
+// drains the tabs' initial load commands, and renders the sidebar + content
 // without panicking.
 func TestModelRenders(t *testing.T) {
+	m, _ := newRenderedTestModel(t, 100, 30)
+
+	view := m.View()
+	for _, want := range []string{"Dashboard", "Planner", "Projects", "Ideas", "Tasks", "agentree", "ctrl+n", "tab"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("view missing %q; got:\n%s", want, view)
+		}
+	}
+
+	// Switch to Projects tab (key "3") and confirm the table shows the project.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	if got := m.View(); !strings.Contains(got, "demo") || !strings.Contains(got, "Branch") {
+		t.Errorf("projects view missing registered project table; got:\n%s", got)
+	}
+}
+
+func TestModelCompactChromeRenders(t *testing.T) {
+	m, _ := newRenderedTestModel(t, 60, 18)
+
+	view := m.View()
+	for _, want := range []string{"1 Dashboard", "2 Planner", "agentree"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("compact view missing %q; got:\n%s", want, view)
+		}
+	}
+}
+
+func TestNumericShortcutsDoNotStealCapturedInput(t *testing.T) {
+	tm, _ := newRenderedTestModel(t, 100, 30)
+	m := tm.(Model)
+
+	// Switch to Projects and enter add mode; that tab now captures text input.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = updated.(Model)
+
+	if m.active != tabProjects {
+		t.Fatalf("numeric input switched tabs while Projects was capturing input; active=%v", m.active)
+	}
+	if !strings.Contains(m.View(), "repo path") {
+		t.Fatalf("projects add input lost focus; got:\n%s", m.View())
+	}
+}
+
+func newRenderedTestModel(t *testing.T, width, height int) (tea.Model, *store.Store) {
+	t.Helper()
+
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { _ = st.Close() })
 
 	ctx := context.Background()
-	if _, err := st.CreateProject(ctx, "demo", "/tmp/demo", "main"); err != nil {
+	proj, err := st.CreateProject(ctx, "demo", "/tmp/demo", "main")
+	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	if _, err := st.CreateIdea(ctx, store.Idea{Title: "ship it", Priority: 2}); err != nil {
 		t.Fatalf("create idea: %v", err)
+	}
+	if _, err := st.CreateTask(ctx, store.Task{ProjectID: proj.ID, Title: "ship dashboard", Status: store.StatusRunning, AgentKind: store.AgentCodex}); err != nil {
+		t.Fatalf("create task: %v", err)
 	}
 
 	cfg := &config.Config{BrainProvider: config.ProviderOpenAI}
@@ -40,20 +94,8 @@ func TestModelRenders(t *testing.T) {
 		m, _ = m.Update(msg)
 	}
 
-	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-
-	view := m.View()
-	for _, want := range []string{"Dashboard", "Planner", "Ideas", "agentree"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("view missing %q; got:\n%s", want, view)
-		}
-	}
-
-	// Switch to Projects tab (key "3") and confirm the project shows.
-	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
-	if got := m.View(); !strings.Contains(got, "demo") {
-		t.Errorf("projects view missing registered project; got:\n%s", got)
-	}
+	m, _ = m.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	return m, st
 }
 
 // drain executes a tea.Cmd (and batched children) and returns the produced

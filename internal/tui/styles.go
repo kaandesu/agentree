@@ -9,6 +9,13 @@ type Theme struct {
 	TabBar      lipgloss.Style
 	TabActive   lipgloss.Style
 	TabInactive lipgloss.Style
+	Sidebar     lipgloss.Style
+	SidebarLogo lipgloss.Style
+	NavActive   lipgloss.Style
+	NavInactive lipgloss.Style
+	NavBadge    lipgloss.Style
+	PageHeader  lipgloss.Style
+	ContentPane lipgloss.Style
 	Title       lipgloss.Style
 	StatusBar   lipgloss.Style
 	Help        lipgloss.Style
@@ -38,6 +45,13 @@ var (
 	colErr     = lipgloss.Color("196") // red
 )
 
+func fitDim(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // NewTheme builds the default theme.
 func NewTheme() Theme {
 	return Theme{
@@ -52,6 +66,31 @@ func NewTheme() Theme {
 		TabInactive: lipgloss.NewStyle().
 			Foreground(colSubtle).
 			Padding(0, 2),
+		Sidebar: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colBorder).
+			Padding(1, 1),
+		SidebarLogo: lipgloss.NewStyle().
+			Foreground(colActive).
+			Bold(true),
+		NavActive: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("16")).
+			Background(colActive).
+			Bold(true).
+			Padding(0, 1),
+		NavInactive: lipgloss.NewStyle().
+			Foreground(colFgLight).
+			Padding(0, 1),
+		NavBadge: lipgloss.NewStyle().
+			Foreground(colActive).
+			Bold(true),
+		PageHeader: lipgloss.NewStyle().
+			Foreground(colFgLight).
+			Bold(true).
+			Padding(0, 1),
+		ContentPane: lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colBorder),
 		Title: lipgloss.NewStyle().
 			Foreground(colAccent).
 			Bold(true),

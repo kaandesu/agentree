@@ -9,6 +9,7 @@ import (
 
 	"agentree/internal/store"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -23,16 +24,47 @@ type ideas struct {
 	items  []store.Idea
 	loaded bool
 	cursor int
+	list   list.Model
 }
 
 func newIdeas(st *store.Store, th Theme) *ideas {
-	return &ideas{store: st, theme: th}
+	delegate := list.NewDefaultDelegate()
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.Foreground(colActive).BorderForeground(colActive)
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.Foreground(colSubtle).BorderForeground(colActive)
+	l := list.New(nil, delegate, 0, 0)
+	l.Title = "Ideas"
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)
+	l.SetShowHelp(false)
+	l.SetFilteringEnabled(false)
+	return &ideas{store: st, theme: th, list: l}
 }
+
+type ideaListItem struct{ idea store.Idea }
+
+func (i ideaListItem) Title() string {
+	return fmt.Sprintf("P%d  %s", i.idea.Priority, i.idea.Title)
+}
+
+func (i ideaListItem) Description() string {
+	if strings.TrimSpace(i.idea.Rationale) != "" {
+		return i.idea.Rationale
+	}
+	if strings.TrimSpace(i.idea.Body) != "" {
+		return strings.TrimSpace(i.idea.Body)
+	}
+	return "captured idea"
+}
+
+func (i ideaListItem) FilterValue() string { return i.idea.Title }
 
 type ideasLoadedMsg struct{ items []store.Idea }
 
 // promoteIdeaMsg asks the root to open the Planner prefilled from this idea.
 type promoteIdeaMsg struct{ idea store.Idea }
+
+// deleteIdeaRequestMsg asks the root to confirm and hard-delete this idea.
+type deleteIdeaRequestMsg struct{ idea store.Idea }
 
 // statusMsg sets the root status line from a tab action (e.g. export path).
 type statusMsg struct{ text string }
@@ -60,6 +92,7 @@ func (i *ideas) Update(msg tea.Msg) (tab, tea.Cmd) {
 		if i.cursor < 0 {
 			i.cursor = 0
 		}
+		i.refreshList()
 	case ideaCapturedMsg:
 		// A new idea was filed via the modal — refresh.
 		return i, i.refresh()
@@ -70,17 +103,25 @@ func (i *ideas) Update(msg tea.Msg) (tab, tea.Cmd) {
 }
 
 func (i *ideas) handleKey(msg tea.KeyMsg) (tab, tea.Cmd) {
+	if i.list.FilterState() == list.Filtering {
+		var cmd tea.Cmd
+		i.list, cmd = i.list.Update(msg)
+		i.cursor = i.list.Index()
+		return i, cmd
+	}
 	switch msg.String() {
 	case "r":
 		return i, i.refresh()
 	case "up", "k":
-		if i.cursor > 0 {
-			i.cursor--
-		}
+		var cmd tea.Cmd
+		i.list, cmd = i.list.Update(msg)
+		i.cursor = i.list.Index()
+		return i, cmd
 	case "down", "j":
-		if i.cursor < len(i.items)-1 {
-			i.cursor++
-		}
+		var cmd tea.Cmd
+		i.list, cmd = i.list.Update(msg)
+		i.cursor = i.list.Index()
+		return i, cmd
 	case "1", "2", "3", "4", "5":
 		if sel := i.selected(); sel != nil {
 			p, _ := strconv.Atoi(msg.String())
@@ -101,18 +142,27 @@ func (i *ideas) handleKey(msg tea.KeyMsg) (tab, tea.Cmd) {
 			idea := *sel
 			return i, func() tea.Msg { return promoteIdeaMsg{idea: idea} }
 		}
+	case "x":
+		if sel := i.selected(); sel != nil {
+			idea := *sel
+			return i, func() tea.Msg { return deleteIdeaRequestMsg{idea: idea} }
+		}
 	case "e":
 		return i, i.exportCmd()
 	}
-	return i, nil
+	var cmd tea.Cmd
+	i.list, cmd = i.list.Update(msg)
+	i.cursor = i.list.Index()
+	return i, cmd
 }
 
 // selected returns the idea under the cursor, or nil if the pile is empty.
 func (i *ideas) selected() *store.Idea {
-	if i.cursor < 0 || i.cursor >= len(i.items) {
+	item, ok := i.list.SelectedItem().(ideaListItem)
+	if !ok {
 		return nil
 	}
-	return &i.items[i.cursor]
+	return &item.idea
 }
 
 // exportCmd writes the prioritized pile to a timestamped markdown file in the
@@ -159,39 +209,30 @@ func renderIdeasMarkdown(items []store.Idea) string {
 	return b.String()
 }
 
-func (i *ideas) SetSize(w, h int) { i.w, i.h = w, h }
+func (i *ideas) SetSize(w, h int) {
+	i.w, i.h = w, h
+	i.refreshList()
+}
+
+func (i *ideas) refreshList() {
+	items := make([]list.Item, 0, len(i.items))
+	for _, it := range i.items {
+		items = append(items, ideaListItem{idea: it})
+	}
+	_ = i.list.SetItems(items)
+	i.list.SetSize(fitDim(i.w-4), fitDim(i.h-5))
+	i.list.Select(i.cursor)
+}
 
 func (i *ideas) View() string {
 	var b strings.Builder
-	b.WriteString(i.theme.Title.Render("Idea pile (by priority)"))
-	b.WriteString("\n\n")
 	if !i.loaded {
 		b.WriteString(i.theme.Subtle.Render("loading…"))
 	} else if len(i.items) == 0 {
 		b.WriteString(i.theme.Subtle.Render("Empty. Press ctrl+n anywhere to pitch an idea — the brain triages it by priority."))
 	} else {
-		lastPri := 0
-		for idx, it := range i.items {
-			if it.Priority != lastPri {
-				if lastPri != 0 {
-					b.WriteString("\n")
-				}
-				b.WriteString(i.theme.Accent.Render(fmt.Sprintf("P%d", it.Priority)) + "\n")
-				lastPri = it.Priority
-			}
-			cursor := "  "
-			title := it.Title
-			if idx == i.cursor {
-				cursor = i.theme.Accent.Render("▸ ")
-				title = i.theme.Accent.Render(it.Title)
-			}
-			b.WriteString(cursor + "• " + title + "\n")
-			if idx == i.cursor && strings.TrimSpace(it.Rationale) != "" {
-				b.WriteString("    " + i.theme.Subtle.Render(it.Rationale) + "\n")
-			}
-		}
-		b.WriteString("\n")
-		b.WriteString(i.theme.Help.Render("↑/↓: move · 1–5: set priority · p: promote to plan · e: export · r: refresh"))
+		b.WriteString(i.list.View())
+		b.WriteString(i.theme.Help.Render("↑/↓: move · 1–5: set priority · p: promote to plan · x: delete · e: export · r: refresh"))
 	}
 	return lipgloss.NewStyle().Width(i.w).Height(i.h).Padding(1, 2).Render(b.String())
 }

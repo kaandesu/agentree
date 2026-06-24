@@ -93,6 +93,59 @@ func (m *Model) shipActionCmd(sessionID int, action string) tea.Cmd {
 	}
 }
 
+// taskRemovedMsg reports a task removal: the affected agent sessions are dropped
+// from the session map (their tmux windows are already killed).
+type taskRemovedMsg struct {
+	taskID     int64
+	sessionIDs []int
+}
+
+// handleRemoveTaskRequest opens a confirm overlay for removing a task. It gathers
+// the task's live agent sessions up front (the root owns the session map) so the
+// confirmed command kills exactly those windows — worktrees are left on disk.
+func (m *Model) handleRemoveTaskRequest(task store.Task) (tea.Model, tea.Cmd) {
+	var sids []int
+	var winIDs []string
+	for _, s := range m.sessions {
+		if s.taskID == task.ID && s.kind == "agent" && !s.dead {
+			sids = append(sids, s.id)
+			winIDs = append(winIDs, s.windowID)
+		}
+	}
+	detail := "mark the task discarded; it won’t run anymore"
+	if len(winIDs) > 0 {
+		detail = fmt.Sprintf("kill %d running agent(s) (worktrees kept) and mark the task discarded", len(winIDs))
+	}
+	cm := newConfirmModal(m.theme, "Remove this task?", detail, m.removeTaskCmd(task.ID, sids, winIDs))
+	cm.SetSize(m.width, m.height)
+	m.overlay = &cm
+	return *m, nil
+}
+
+// removeTaskCmd kills the task's live agent windows (best-effort, worktrees left
+// intact), marks the task discarded, and records the event.
+func (m *Model) removeTaskCmd(taskID int64, sids []int, winIDs []string) tea.Cmd {
+	st, tm := m.store, m.tmux
+	return func() tea.Msg {
+		c := ctx()
+		for _, w := range winIDs {
+			_ = tm.KillWindow(c, w) // best-effort; worktree left intact
+		}
+		_ = st.UpdateTaskStatus(c, taskID, store.StatusDiscarded)
+		_ = st.Emit(c, store.EventTaskRemoved, map[string]any{"task": taskID, "agents": len(winIDs)})
+		return taskRemovedMsg{taskID: taskID, sessionIDs: sids}
+	}
+}
+
+// handleTaskRemoved drops the killed sessions from the map and refreshes tasks.
+func (m *Model) handleTaskRemoved(msg taskRemovedMsg) (tea.Model, tea.Cmd) {
+	for _, sid := range msg.sessionIDs {
+		delete(m.sessions, sid) // stop tracking; tmux window already killed
+	}
+	m.status = "task removed"
+	return *m, tea.Batch(m.ensurePolling(), listTasksCmd(m.store))
+}
+
 // soleAgentForTask reports whether exactly one agent session belongs to taskID.
 func (m *Model) soleAgentForTask(taskID int64) bool {
 	n := 0

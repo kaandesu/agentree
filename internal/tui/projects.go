@@ -7,6 +7,7 @@ import (
 	"agentree/internal/orchestrator"
 	"agentree/internal/store"
 
+	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -23,6 +24,7 @@ type projects struct {
 
 	adding bool
 	input  textinput.Model
+	table  table.Model
 	errMsg string
 }
 
@@ -30,7 +32,8 @@ func newProjects(st *store.Store, th Theme) *projects {
 	ti := textinput.New()
 	ti.Placeholder = "/absolute/path/to/repo"
 	ti.Prompt = "repo path › "
-	return &projects{store: st, theme: th, input: ti}
+	tbl := table.New(table.WithFocused(true))
+	return &projects{store: st, theme: th, input: ti, table: tbl}
 }
 
 type projectsLoadedMsg struct{ items []store.Project }
@@ -71,6 +74,7 @@ func (p *projects) Update(msg tea.Msg) (tab, tea.Cmd) {
 	case projectsLoadedMsg:
 		p.items = msg.items
 		p.loaded = true
+		p.refreshTable()
 		return p, nil
 	case projectRegisteredMsg:
 		p.adding = false
@@ -111,18 +115,50 @@ func (p *projects) Update(msg tea.Msg) (tab, tea.Cmd) {
 		case "r":
 			return p, p.refresh()
 		}
+		var cmd tea.Cmd
+		p.table, cmd = p.table.Update(msg)
+		return p, cmd
 	}
 	return p, nil
 }
 
-func (p *projects) SetSize(w, h int) { p.w, p.h = w, h }
+func (p *projects) SetSize(w, h int) {
+	p.w, p.h = w, h
+	p.refreshTable()
+}
+
+func (p *projects) refreshTable() {
+	nameW := 18
+	branchW := 12
+	pathW := p.w - nameW - branchW - 8
+	if pathW < 18 {
+		pathW = 18
+	}
+	p.table.SetColumns([]table.Column{
+		{Title: "Project", Width: nameW},
+		{Title: "Branch", Width: branchW},
+		{Title: "Path", Width: pathW},
+	})
+	rows := make([]table.Row, 0, len(p.items))
+	for _, it := range p.items {
+		rows = append(rows, table.Row{it.Name, it.DefaultBranch, it.RepoPath})
+	}
+	p.table.SetRows(rows)
+	p.table.SetWidth(fitDim(p.w - 4))
+	p.table.SetHeight(fitDim(p.h - 6))
+	p.table.Focus()
+	styles := table.DefaultStyles()
+	styles.Header = styles.Header.Foreground(colActive).Bold(true)
+	styles.Selected = styles.Selected.Foreground(colFgLight).Background(colBorder)
+	p.table.SetStyles(styles)
+}
 
 func (p *projects) View() string {
 	var b strings.Builder
-	b.WriteString(p.theme.Title.Render("Registered projects"))
-	b.WriteString("\n\n")
 
 	if p.adding {
+		b.WriteString(p.theme.Title.Render("Add project"))
+		b.WriteString("\n\n")
 		b.WriteString(p.input.View())
 		b.WriteString("\n")
 		if p.errMsg != "" {
@@ -138,12 +174,7 @@ func (p *projects) View() string {
 	} else if len(p.items) == 0 {
 		b.WriteString(p.theme.Subtle.Render("No projects registered yet."))
 	} else {
-		for _, it := range p.items {
-			b.WriteString(p.theme.Accent.Render(it.Name))
-			b.WriteString("  ")
-			b.WriteString(p.theme.Subtle.Render(it.RepoPath + "  (" + it.DefaultBranch + ")"))
-			b.WriteString("\n")
-		}
+		b.WriteString(p.table.View())
 	}
 	b.WriteString("\n" + p.theme.Help.Render("a: add project · r: refresh"))
 	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(b.String())

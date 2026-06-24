@@ -3,8 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -16,34 +14,14 @@ import (
 
 // --- planning flow messages ---
 
-// planPreparedMsg is produced after the spec is expanded; the root then opens
-// the claude plan-mode tmux window. No worktree is created yet — planning runs
-// read-only in the repo, and worktrees are provisioned lazily per sub-task once
-// the plan is split.
-type planPreparedMsg struct {
-	taskID      int64
-	title       string
-	expanded    string
-	snapshot    map[string]bool
-	projectID   int64
-	projectName string
-	repoPath    string
-	baseBranch  string
-}
-
-// planSessionStartedMsg notifies the planner that its request was launched.
-type planSessionStartedMsg struct{ title string }
-
-// planPollMsg drives periodic tmux window status + plan-file detection.
+// planPollMsg drives periodic tmux window status checks.
 type planPollMsg struct{}
 
 // attachReturnedMsg fires when the user detaches from tmux (tea.ExecProcess
-// callback). On detach we opportunistically ingest+split any ready plan.
+// callback).
 type attachReturnedMsg struct{ err error }
 
-// windowView is one session's status for the dashboard. It carries enough
-// session/worktree context for the dashboard to render the tree and offer
-// completion actions (PR/merge/discard) without reaching back into the Model.
+// windowView is one session's status for the dashboard.
 type windowView struct {
 	sessionID    int
 	parentID     int
@@ -74,10 +52,8 @@ type agentSpawn struct {
 	branch   string
 }
 
-// planSplitMsg is the result of ingesting a plan and fanning it out into
-// parallel build agents. The project fields let applyPlanSplit build shippable
-// agent sessions even when there's no parent plan session (the "split now" path,
-// where planSessionID is 0).
+// planSplitMsg is the result of fanning a proposal out into parallel build
+// agents. Reused by both the old and new flows for applyPlanSplit.
 type planSplitMsg struct {
 	planSessionID int
 	planTaskID    int64
@@ -90,99 +66,9 @@ type planSplitMsg struct {
 	err           error
 }
 
-// preparePlanCmd creates the task and expands the spec off the Update loop. It
-// returns planPreparedMsg on success or errMsg on failure.
-func (m Model) preparePlanCmd(req launchPlanRequestMsg) tea.Cmd {
-	st := m.store
-	br := m.brain
-	return func() tea.Msg {
-		c := context.Background()
-		title := firstLine(req.spec)
-
-		task, err := st.CreateTask(c, store.Task{
-			ProjectID: req.project.ID,
-			IdeaID:    req.ideaID,
-			Title:     title,
-			Spec:      req.spec,
-			Status:    store.StatusPlanning,
-			AgentKind: store.AgentClaude,
-		})
-		if err != nil {
-			return errMsg{err}
-		}
-
-		// Fail-soft: ExpandSpec returns a usable prompt even on API error.
-		expanded, _ := br.ExpandSpec(c, req.spec)
-
-		return planPreparedMsg{
-			taskID:      task.ID,
-			title:       title,
-			expanded:    expanded,
-			snapshot:    snapshotPlans(plansDir()),
-			projectID:   req.project.ID,
-			projectName: req.project.Name,
-			repoPath:    req.project.RepoPath,
-			baseBranch:  req.project.DefaultBranch,
-		}
-	}
-}
-
-// startPlanSession opens claude plan mode in a tmux window inside the repo and
-// registers the session. The user attaches to drive the interrogation; on
-// detach (or claude exiting) the plan is auto-split into parallel agents.
-func (m *Model) startPlanSession(p planPreparedMsg) (tea.Model, tea.Cmd) {
-	if !orchestrator.TmuxAvailable() {
-		m.err = fmt.Errorf("tmux not found on PATH — install tmux to run agents")
-		return *m, nil
-	}
-	c := context.Background()
-	if err := m.tmux.Ensure(c); err != nil {
-		m.err = err
-		return *m, nil
-	}
-
-	m.nextSessID++
-	id := m.nextSessID
-	wid, err := m.tmux.NewWindow(c, orchestrator.Slugify(p.title), p.repoPath, claudePlanArgv(p.expanded))
-	if err != nil {
-		m.err = err
-		return *m, nil
-	}
-
-	m.sessions[id] = &session{
-		id:          id,
-		taskID:      p.taskID,
-		title:       p.title,
-		kind:        "plan",
-		windowID:    wid,
-		dir:         p.repoPath,
-		projectID:   p.projectID,
-		projectName: p.projectName,
-		repoPath:    p.repoPath,
-		baseBranch:  p.baseBranch,
-		plansDir:    plansDir(),
-		snapshot:    p.snapshot,
-		launchAt:    time.Now(),
-	}
-	m.lastSession = id
-	if m.tmux.Inherited() {
-		m.status = "planning: " + p.title + " — answer claude in the pane on the right; agentree splits it into agents once the plan is ready"
-	} else {
-		m.status = "planning: " + p.title + " — press ctrl+o to attach (answer claude, then ctrl+b d to detach & auto-split)"
-	}
-
-	poll := m.ensurePolling()
-	return *m, tea.Batch(
-		poll,
-		func() tea.Msg { return planSessionStartedMsg{title: p.title} },
-		listTasksCmd(m.store),
-	)
-}
-
-// startSplitNow handles the "split now" launch: it skips plan-mode
-// interrogation and fans the spec straight out into parallel worktree agents.
-// Used when the user has already decomposed the work (e.g. M4/M5/M6).
-func (m *Model) startSplitNow(req launchPlanRequestMsg) (tea.Model, tea.Cmd) {
+// spawnFromProposal handles a confirmed proposal: creates the task, provisions
+// worktrees, and launches claude build agents for each sub-task.
+func (m *Model) spawnFromProposal(msg launchFromProposalMsg) (tea.Model, tea.Cmd) {
 	if !orchestrator.TmuxAvailable() {
 		m.err = fmt.Errorf("tmux not found on PATH — install tmux to run agents")
 		return *m, nil
@@ -191,31 +77,29 @@ func (m *Model) startSplitNow(req launchPlanRequestMsg) (tea.Model, tea.Cmd) {
 		m.err = err
 		return *m, nil
 	}
-	m.status = "splitting spec into parallel agents…"
+	total := msg.proposal.TotalAgents()
+	m.status = fmt.Sprintf("spawning %d agent(s) across %d feature(s)…", total, len(msg.proposal.Features))
 	return *m, tea.Batch(
-		m.prepareSplitCmd(req),
-		func() tea.Msg { return planSessionStartedMsg{title: firstLine(req.spec)} },
+		m.spawnProposalCmd(msg),
+		func() tea.Msg { return planSessionStartedMsg{title: firstLine(msg.spec)} },
 	)
 }
 
-// prepareSplitCmd creates the task, splits the raw spec into independent
-// sub-tasks (SplitPlan accepts arbitrary text and returns at least one), and
-// provisions a worktree + claude build agent per sub-task. It mirrors the body
-// of ingestSplitCmd minus the plan-file read and the plan window. applyPlanSplit
-// registers the spawns (with planSessionID 0 — there is no parent plan session).
-func (m Model) prepareSplitCmd(req launchPlanRequestMsg) tea.Cmd {
+// spawnProposalCmd creates the task and provisions worktrees + agents for each
+// sub-task in the proposal. It returns a planSplitMsg so the existing
+// applyPlanSplit pipeline registers the sessions.
+func (m Model) spawnProposalCmd(msg launchFromProposalMsg) tea.Cmd {
 	st := m.store
-	br := m.brain
 	tm := m.tmux
 	wt := m.wt
 	return func() tea.Msg {
 		c := context.Background()
-		title := firstLine(req.spec)
+		title := firstLine(msg.spec)
 		task, err := st.CreateTask(c, store.Task{
-			ProjectID: req.project.ID,
-			IdeaID:    req.ideaID,
+			ProjectID: msg.project.ID,
+			IdeaID:    msg.ideaID,
 			Title:     title,
-			Spec:      req.spec,
+			Spec:      msg.spec,
 			Status:    store.StatusRunning,
 			AgentKind: store.AgentClaude,
 		})
@@ -223,132 +107,48 @@ func (m Model) prepareSplitCmd(req launchPlanRequestMsg) tea.Cmd {
 			return errMsg{err}
 		}
 
-		subs, _ := br.SplitPlan(c, req.spec)
 		var spawns []agentSpawn
-		for _, sub := range subs {
-			wtree, err := wt.Create(c, req.project.RepoPath, req.project.Name, sub.Title, req.project.DefaultBranch)
-			if err != nil {
-				continue
+		for _, feature := range msg.proposal.Features {
+			for _, sub := range feature.SubTasks {
+				wtree, err := wt.Create(c, msg.project.RepoPath, msg.project.Name, sub.Title, msg.project.DefaultBranch)
+				if err != nil {
+					continue
+				}
+				_ = st.Emit(c, store.EventWorktreeCreated, map[string]any{
+					"task": task.ID, "feature": feature.Title, "title": sub.Title,
+					"branch": wtree.Branch, "path": wtree.Path,
+				})
+				wid, err := tm.NewWindow(c, orchestrator.Slugify(sub.Title), wtree.Path, claudeBuildArgv(sub.Prompt))
+				if err != nil {
+					continue
+				}
+				spawns = append(spawns, agentSpawn{
+					title: sub.Title, windowID: wid,
+					worktree: wtree.Path, branch: wtree.Branch,
+				})
 			}
-			_ = st.Emit(c, store.EventWorktreeCreated, map[string]any{
-				"task": task.ID, "title": sub.Title, "branch": wtree.Branch, "path": wtree.Path,
-			})
-			wid, err := tm.NewWindow(c, orchestrator.Slugify(sub.Title), wtree.Path, claudeBuildArgv(sub.Prompt))
-			if err != nil {
-				continue
-			}
-			spawns = append(spawns, agentSpawn{title: sub.Title, windowID: wid, worktree: wtree.Path, branch: wtree.Branch})
 		}
 		_ = st.Emit(c, store.EventPlanSplit, map[string]any{"task": task.ID, "agents": len(spawns)})
 		var splitErr error
 		if len(spawns) == 0 {
-			splitErr = fmt.Errorf("could not create any worktree agents for this spec")
+			splitErr = fmt.Errorf("could not create any worktree agents for this proposal")
 		}
-		return planSplitMsg{planSessionID: 0, planTaskID: task.ID, spawns: spawns,
-			projectID: req.project.ID, projectName: req.project.Name,
-			repoPath: req.project.RepoPath, baseBranch: req.project.DefaultBranch, err: splitErr}
-	}
-}
-
-// ingestSplitCmd reads the plan a plan-session produced (file first, captured
-// pane as fallback), splits it into parallel sub-tasks, and provisions a
-// worktree + claude build window for each. It only kills the planning window
-// once it actually has plan content, so an early detach (claude still asking
-// questions) leaves the window alive for the user to re-attach.
-func (m Model) ingestSplitCmd(s *session) tea.Cmd {
-	st := m.store
-	br := m.brain
-	tm := m.tmux
-	wt := m.wt
-
-	sessID := s.id
-	taskID := s.taskID
-	winID := s.windowID
-	planPath := s.planPath
-	plans := s.plansDir
-	snap := s.snapshot
-	launchAt := s.launchAt
-	repo := s.repoPath
-	projName := s.projectName
-	baseBranch := s.baseBranch
-	projID := s.projectID
-
-	return func() tea.Msg {
-		c := context.Background()
-
-		if planPath == "" {
-			planPath = findNewPlan(plans, snap, launchAt)
+		return planSplitMsg{
+			planSessionID: 0, planTaskID: task.ID, spawns: spawns,
+			projectID: msg.project.ID, projectName: msg.project.Name,
+			repoPath: msg.project.RepoPath, baseBranch: msg.project.DefaultBranch,
+			err: splitErr,
 		}
-		// The plan file (~/.claude/plans/<slug>.md) is the only clean source:
-		// plan mode is read-only, so claude persists the plan there rather than
-		// to the repo. We never scrape the live pane — that's TUI chrome, not
-		// markdown — so a missing file means "no plan yet", not garbage to split.
-		var planText string
-		if planPath != "" {
-			if b, err := os.ReadFile(planPath); err == nil {
-				planText = string(b)
-			}
-		}
-		if strings.TrimSpace(planText) == "" {
-			return planSplitMsg{planSessionID: sessID, planTaskID: taskID,
-				err: fmt.Errorf("no plan file yet — attach and let claude present the plan")}
-		}
-
-		_ = st.SetTaskPlanReady(c, taskID, planPath)
-		_ = st.AppendEvent(c, "plan.ready", `{"task":`+strconv.FormatInt(taskID, 10)+`}`)
-		// Belt-and-suspenders: stop the planning agent so it can't start
-		// building in the repo while we fan the work out into worktrees.
-		_ = tm.KillWindow(c, winID)
-
-		subs, _ := br.SplitPlan(c, planText)
-		var spawns []agentSpawn
-		for _, sub := range subs {
-			wtree, err := wt.Create(c, repo, projName, sub.Title, baseBranch)
-			if err != nil {
-				continue
-			}
-			_ = st.Emit(c, store.EventWorktreeCreated, map[string]any{
-				"task": taskID, "title": sub.Title, "branch": wtree.Branch, "path": wtree.Path,
-			})
-			wid, err := tm.NewWindow(c, orchestrator.Slugify(sub.Title), wtree.Path, claudeBuildArgv(sub.Prompt))
-			if err != nil {
-				continue
-			}
-			spawns = append(spawns, agentSpawn{title: sub.Title, windowID: wid, worktree: wtree.Path, branch: wtree.Branch})
-		}
-		_ = st.Emit(c, store.EventPlanSplit, map[string]any{"task": taskID, "agents": len(spawns)})
-		return planSplitMsg{planSessionID: sessID, planTaskID: taskID, planPath: planPath, spawns: spawns,
-			projectID: projID, projectName: projName, repoPath: repo, baseBranch: baseBranch}
 	}
 }
 
 // applyPlanSplit registers the spawned agents as sessions and advances the task.
 func (m *Model) applyPlanSplit(msg planSplitMsg) (tea.Model, tea.Cmd) {
-	ps := m.sessions[msg.planSessionID]
 	if msg.err != nil && len(msg.spawns) == 0 {
-		if ps != nil {
-			ps.splitting = false
-			if ps.dead {
-				// Window exited without ever producing a plan: terminal, so the
-				// poll loop stops retrying it.
-				ps.failed = true
-				m.status = "plan session ended without a plan — relaunch from the Planner"
-			} else {
-				// Detached before the plan was ready; leave it live to retry.
-				m.status = msg.err.Error()
-			}
-		} else {
-			// No parent plan session (the "split now" path): surface the error.
-			m.status = "split failed: " + msg.err.Error()
-		}
+		m.status = "split failed: " + msg.err.Error()
 		return *m, nil
 	}
 
-	if ps != nil {
-		ps.ingested = true
-		ps.dead = true
-		ps.splitting = false
-	}
 	_ = m.store.UpdateTaskStatus(ctx(), msg.planTaskID, store.StatusRunning)
 
 	for _, sp := range msg.spawns {
@@ -381,9 +181,8 @@ func (m *Model) applyPlanSplit(msg planSplitMsg) (tea.Model, tea.Cmd) {
 	return *m, tea.Batch(poll, listTasksCmd(m.store))
 }
 
-// handlePlanPoll refreshes tmux window state, auto-splits any plan whose window
-// has died, publishes the window list to the dashboard, and re-arms while work
-// remains.
+// handlePlanPoll refreshes tmux window state, publishes the window list to the
+// dashboard, and re-arms while work remains.
 func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 	c := context.Background()
 	wins, _ := m.tmux.ListWindows(c)
@@ -399,8 +198,6 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 		w, ok := byID[s.windowID]
 		if !ok || w.Dead {
 			if !s.dead && s.kind == "agent" && !s.exitedReported {
-				// Newly-dead agent: record a clean-vs-errored exit for the
-				// supervisor. (Missing window == killed/clean, status 0.)
 				s.exitedReported = true
 				agentDied = true
 				code := 0
@@ -418,19 +215,6 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 			}
 			s.dead = true
 		}
-		if s.kind == "plan" && !s.ingested && !s.failed {
-			if s.planPath == "" {
-				if p := findNewPlan(s.plansDir, s.snapshot, s.launchAt); p != "" {
-					s.planPath = p
-				}
-			}
-			// claude exited on its own: ingest + split now.
-			if s.dead && !s.splitting {
-				s.splitting = true
-				cmds = append(cmds, m.ingestSplitCmd(s))
-			}
-			pending = true
-		}
 		if s.kind == "agent" && !s.dead {
 			pending = true
 		}
@@ -438,7 +222,7 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 
 	var views []windowView
 	for _, s := range m.sessions {
-		w, ok := byID[s.windowID]
+		w := byID[s.windowID]
 		var elapsed time.Duration
 		if !s.launchAt.IsZero() {
 			elapsed = time.Since(s.launchAt)
@@ -449,7 +233,7 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 			taskID:       s.taskID,
 			title:        s.title,
 			kind:         s.kind,
-			dead:         s.dead || !ok,
+			dead:         s.dead || !ok(byID, s.windowID),
 			status:       w.Status,
 			elapsed:      elapsed,
 			lastActivity: w.LastActivity,
@@ -462,17 +246,10 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 	cmds = append(cmds, func() tea.Msg {
 		return windowsMsg{windows: views, attach: m.tmux.AttachCommand()}
 	})
-	// Run the supervisor every few ticks (~6s) when agents are live, so its
-	// git-backed conflict/idle checks don't run as hot as the tmux poll. Also
-	// run once on any agent death: the poll loop halts when no live work
-	// remains (pending=false below), so without this an errored exit landing on
-	// a non-supervise tick would never surface a suggestion.
 	m.superviseTick++
 	if agentDied || m.superviseTick%3 == 0 {
 		cmds = append(cmds, m.superviseCmd())
 	}
-	// This tick consumed the live loop; re-arm only if work remains, otherwise
-	// let the loop end (a starter re-arms it via ensurePolling later).
 	if pending {
 		cmds = append(cmds, m.pollCmd())
 	} else {
@@ -481,22 +258,17 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 	return *m, tea.Batch(cmds...)
 }
 
-// handleAttachReturned fires after the user detaches from tmux. We try to
-// ingest+split every not-yet-split plan session (no-op if no plan is ready).
-func (m *Model) handleAttachReturned() (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
-	for _, s := range m.sessions {
-		if s.kind == "plan" && !s.ingested && !s.failed && !s.splitting {
-			s.splitting = true
-			cmds = append(cmds, m.ingestSplitCmd(s))
-		}
-	}
-	cmds = append(cmds, m.ensurePolling())
-	return *m, tea.Batch(cmds...)
+func ok(m map[string]orchestrator.Window, id string) bool {
+	_, found := m[id]
+	return found
 }
 
-// ensurePolling starts the periodic poll loop if one isn't already running,
-// returning nil otherwise so callers never spawn parallel tick loops.
+// handleAttachReturned fires after the user detaches from tmux.
+func (m *Model) handleAttachReturned() (tea.Model, tea.Cmd) {
+	return *m, m.ensurePolling()
+}
+
+// ensurePolling starts the periodic poll loop if one isn't already running.
 func (m *Model) ensurePolling() tea.Cmd {
 	if m.polling {
 		return nil
@@ -505,10 +277,7 @@ func (m *Model) ensurePolling() tea.Cmd {
 	return m.pollCmd()
 }
 
-// focusOrAttachCmd reacts to ctrl+o. In inherited mode the agents are already
-// visible panes, so it just moves tmux focus to the next agent pane. In the
-// standalone fallback it hands the terminal to tmux to attach (suspending
-// agentree's loop until the user detaches → attachReturnedMsg).
+// focusOrAttachCmd reacts to ctrl+o.
 func (m Model) focusOrAttachCmd() tea.Cmd {
 	if len(m.sessions) == 0 {
 		return func() tea.Msg { return statusMsg{text: "no live agents yet"} }
@@ -537,8 +306,7 @@ func (m Model) pollCmd() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return planPollMsg{} })
 }
 
-// listTasksCmd reloads tasks and emits tasksLoadedMsg (broadcast refreshes the
-// Dashboard and Tasks tabs).
+// listTasksCmd reloads tasks and emits tasksLoadedMsg.
 func listTasksCmd(st *store.Store) tea.Cmd {
 	return func() tea.Msg {
 		ts, err := st.ListTasks(ctx())

@@ -7,17 +7,24 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"agentree/internal/brain"
 	"agentree/internal/orchestrator"
 	"agentree/internal/store"
 )
 
-// TestPreparePlanCreatesTask exercises the non-PTY half of the planning flow:
-// a task is created in `planning` and the spec is expanded. No worktree is
-// created here — planning runs read-only in the repo until the plan is split.
-func TestPreparePlanCreatesTask(t *testing.T) {
+// TestSpawnFromProposalCreatesAgents drives the proposal-driven spawning path:
+// a PlanProposal with features and sub-tasks is fanned out into worktrees +
+// claude build agents. The task lands in `running` and each sub-task becomes
+// a worktree. Gated on git + tmux.
+func TestSpawnFromProposalCreatesAgents(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if !orchestrator.TmuxAvailable() {
+		t.Skip("tmux not available")
+	}
+	c := context.Background()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "t.db"))
 	if err != nil {
@@ -25,186 +32,87 @@ func TestPreparePlanCreatesTask(t *testing.T) {
 	}
 	defer st.Close()
 
-	proj, err := st.CreateProject(ctx(), "demo", "/tmp/demo", "main")
-	if err != nil {
+	repo := initGitRepo(t)
+	proj, _ := st.CreateProject(ctx(), "demo", repo, "main")
+
+	tm := orchestrator.NewTmuxManager(fmt.Sprintf("agentree_proposaltest_%d", os.Getpid()))
+	t.Cleanup(func() { _ = tm.Kill(c) })
+	if err := tm.Ensure(c); err != nil {
 		t.Fatal(err)
 	}
 
 	m := Model{
 		store: st,
 		brain: brain.New(brain.OpenAI, "", ""), // stub
-	}
-
-	msg := m.preparePlanCmd(launchPlanRequestMsg{
-		project: *proj,
-		spec:    "Build OAuth login\nwith Google and GitHub",
-	})()
-
-	prepared, ok := msg.(planPreparedMsg)
-	if !ok {
-		t.Fatalf("expected planPreparedMsg, got %T: %+v", msg, msg)
-	}
-	if prepared.title != "Build OAuth login" {
-		t.Errorf("title = %q", prepared.title)
-	}
-	if prepared.repoPath != "/tmp/demo" {
-		t.Errorf("repoPath = %q", prepared.repoPath)
-	}
-	if prepared.expanded == "" {
-		t.Errorf("spec was not expanded")
-	}
-
-	task, err := st.GetTask(ctx(), prepared.taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if task.Status != store.StatusPlanning {
-		t.Errorf("task status = %q, want planning", task.Status)
-	}
-}
-
-// TestIngestSplitReadsPlanAndSpawns drives the full ingest+split path against a
-// real git repo and tmux server: the plan file is read, the task moves to
-// ready, and (with the stub brain → single sub-task) a worktree + agent window
-// are provisioned. Gated on git + tmux.
-func TestIngestSplitReadsPlanAndSpawns(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	if !orchestrator.TmuxAvailable() {
-		t.Skip("tmux not available")
-	}
-	c := context.Background()
-	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	repo := initGitRepo(t)
-	proj, _ := st.CreateProject(ctx(), "demo", repo, "main")
-	task, _ := st.CreateTask(ctx(), store.Task{ProjectID: proj.ID, Title: "do thing", Status: store.StatusPlanning})
-
-	plans := t.TempDir()
-	launch := time.Now()
-	snap := snapshotPlans(plans)
-	planFile := filepath.Join(plans, "do-thing-clever-turing.md")
-	if err := os.WriteFile(planFile, []byte("# Plan\n1. build the thing"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_ = os.Chtimes(planFile, launch.Add(time.Second), launch.Add(time.Second))
-
-	tm := orchestrator.NewTmuxManager(fmt.Sprintf("agentree_test_%d", os.Getpid()))
-	t.Cleanup(func() { _ = tm.Kill(c) })
-	if err := tm.Ensure(c); err != nil {
-		t.Fatal(err)
-	}
-	planWin, err := tm.NewWindow(c, "plan", repo, []string{"sh", "-c", "sleep 30"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	m := Model{
-		store: st,
-		brain: brain.New(brain.OpenAI, "", ""), // stub → single sub-task
-		wt:    orchestrator.NewWorktreeManager(filepath.Join(dir, "worktrees")),
-		tmux:  tm,
-	}
-	s := &session{
-		id: 1, taskID: task.ID, kind: "plan", windowID: planWin,
-		dir: repo, repoPath: repo, projectName: "demo", baseBranch: "main",
-		plansDir: plans, snapshot: snap, launchAt: launch,
-	}
-
-	msg, ok := m.ingestSplitCmd(s)().(planSplitMsg)
-	if !ok {
-		t.Fatalf("expected planSplitMsg")
-	}
-	if msg.planPath != planFile {
-		t.Errorf("planPath = %q, want %q", msg.planPath, planFile)
-	}
-	if len(msg.spawns) != 1 {
-		t.Fatalf("spawns = %d, want 1", len(msg.spawns))
-	}
-	if _, err := os.Stat(msg.spawns[0].worktree); err != nil {
-		t.Errorf("worktree not created: %v", err)
-	}
-
-	// The planning window must have been killed before fan-out.
-	for _, w := range mustListWindows(t, tm) {
-		if w.ID == planWin {
-			t.Errorf("planning window %s should have been killed", planWin)
-		}
-	}
-
-	got, _ := st.GetTask(ctx(), task.ID)
-	if got.Status != store.StatusReady {
-		t.Errorf("task status = %q, want ready", got.Status)
-	}
-	if got.PlanPath != planFile {
-		t.Errorf("task plan path = %q, want %q", got.PlanPath, planFile)
-	}
-}
-
-// TestPrepareSplitNowSpawnsAgents drives the "split now" path: the raw spec is
-// split (stub brain → single sub-task) and a worktree + agent is provisioned
-// immediately, with no plan-mode session. The task lands in `running` and the
-// result carries project context (planSessionID 0, since there's no parent plan
-// session). Gated on git + tmux.
-func TestPrepareSplitNowSpawnsAgents(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	if !orchestrator.TmuxAvailable() {
-		t.Skip("tmux not available")
-	}
-	c := context.Background()
-	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	repo := initGitRepo(t)
-	proj, _ := st.CreateProject(ctx(), "demo", repo, "main")
-
-	tm := orchestrator.NewTmuxManager(fmt.Sprintf("agentree_splittest_%d", os.Getpid()))
-	t.Cleanup(func() { _ = tm.Kill(c) })
-	if err := tm.Ensure(c); err != nil {
-		t.Fatal(err)
-	}
-
-	m := Model{
-		store: st,
-		brain: brain.New(brain.OpenAI, "", ""), // stub → single sub-task
 		wt:    orchestrator.NewWorktreeManager(filepath.Join(dir, "worktrees")),
 		tmux:  tm,
 	}
 
-	msg, ok := m.prepareSplitCmd(launchPlanRequestMsg{
-		project: *proj, spec: "M4: do X\nM5: do Y", mode: "split",
+	proposal := brain.PlanProposal{
+		Features: []brain.Feature{
+			{
+				Title: "Auth",
+				SubTasks: []brain.SubTask{
+					{Title: "OAuth integration", Prompt: "Build OAuth with Google provider"},
+					{Title: "Session management", Prompt: "Build session management with JWT"},
+				},
+			},
+			{
+				Title: "Dashboard",
+				SubTasks: []brain.SubTask{
+					{Title: "Dashboard UI", Prompt: "Build dashboard React components"},
+				},
+			},
+		},
+	}
+
+	msg, ok := m.spawnProposalCmd(launchFromProposalMsg{
+		project:  *proj,
+		proposal: proposal,
+		spec:     "Build auth and dashboard",
 	})().(planSplitMsg)
 	if !ok {
 		t.Fatalf("expected planSplitMsg")
 	}
 	if msg.planSessionID != 0 {
-		t.Errorf("planSessionID = %d, want 0 (no parent plan session)", msg.planSessionID)
+		t.Errorf("planSessionID = %d, want 0", msg.planSessionID)
 	}
-	if len(msg.spawns) != 1 {
-		t.Fatalf("spawns = %d, want 1", len(msg.spawns))
+	if len(msg.spawns) != 3 {
+		t.Fatalf("spawns = %d, want 3 (2 auth + 1 dashboard)", len(msg.spawns))
+	}
+	for _, sp := range msg.spawns {
+		if _, err := os.Stat(sp.worktree); err != nil {
+			t.Errorf("worktree %q not created: %v", sp.worktree, err)
+		}
 	}
 	if msg.repoPath != repo || msg.baseBranch != "main" {
 		t.Errorf("project context not carried: repo=%q base=%q", msg.repoPath, msg.baseBranch)
-	}
-	if _, err := os.Stat(msg.spawns[0].worktree); err != nil {
-		t.Errorf("worktree not created: %v", err)
 	}
 
 	got, _ := st.GetTask(ctx(), msg.planTaskID)
 	if got.Status != store.StatusRunning {
 		t.Errorf("task status = %q, want running", got.Status)
+	}
+}
+
+// TestStubPlanChatReturnsProposal verifies the stub brain returns a proposal
+// without any API calls.
+func TestStubPlanChatReturnsProposal(t *testing.T) {
+	br := brain.New(brain.OpenAI, "", "") // stub
+	resp, err := br.PlanChat(context.Background(), []brain.ChatMessage{
+		{Role: "user", Content: "Build a todo app with auth"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Proposal == nil {
+		t.Fatal("expected proposal from stub, got text response")
+	}
+	if len(resp.Proposal.Features) != 1 {
+		t.Errorf("features = %d, want 1", len(resp.Proposal.Features))
+	}
+	if resp.Proposal.TotalAgents() < 1 {
+		t.Error("expected at least 1 agent")
 	}
 }
 
@@ -215,25 +123,6 @@ func mustListWindows(t *testing.T, tm *orchestrator.TmuxManager) []orchestrator.
 		t.Fatalf("ListWindows: %v", err)
 	}
 	return ws
-}
-
-func TestFindNewPlanPicksNewestNew(t *testing.T) {
-	dir := t.TempDir()
-	old := filepath.Join(dir, "old.md")
-	os.WriteFile(old, []byte("x"), 0o644)
-	snap := snapshotPlans(dir) // contains old.md
-
-	launch := time.Now()
-	a := filepath.Join(dir, "a.md")
-	b := filepath.Join(dir, "b.md")
-	os.WriteFile(a, []byte("x"), 0o644)
-	os.WriteFile(b, []byte("x"), 0o644)
-	os.Chtimes(a, launch.Add(time.Second), launch.Add(time.Second))
-	os.Chtimes(b, launch.Add(2*time.Second), launch.Add(2*time.Second))
-
-	if got := findNewPlan(dir, snap, launch); got != b {
-		t.Errorf("findNewPlan = %q, want %q (newest new file)", got, b)
-	}
 }
 
 // initGitRepo creates a committed git repo for worktree tests.

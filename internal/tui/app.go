@@ -15,6 +15,7 @@ import (
 	"agentree/internal/orchestrator"
 	"agentree/internal/store"
 
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -51,6 +52,20 @@ var tabTitles = map[tabID]string{
 	tabTasks:     "Tasks",
 }
 
+var tabDescriptions = map[tabID]string{
+	tabDashboard: "sessions + queue",
+	tabPlanner:   "compose work",
+	tabProjects:  "registered repos",
+	tabIdeas:     "triaged backlog",
+	tabTasks:     "task status",
+}
+
+const (
+	sidebarWidth    = 28
+	minSidebarWidth = 72
+	footerHeight    = 1
+)
+
 // tab is the contract every tab model implements. Tabs receive sizing and
 // render into the content area between the tab bar and status bar.
 type tab interface {
@@ -73,6 +88,7 @@ type Model struct {
 	tmux  *orchestrator.TmuxManager
 	ship  orchestrator.Shipper
 	keys  KeyMap
+	help  help.Model
 	theme Theme
 
 	width, height int
@@ -111,6 +127,7 @@ func New(cfg *config.Config, st *store.Store) Model {
 		tmux:     newTmuxManager(cfg),
 		ship:     orchestrator.NewGitShipper(),
 		keys:     DefaultKeyMap(),
+		help:     help.New(),
 		theme:    theme,
 		active:   tabDashboard,
 		sessions: map[int]*session{},
@@ -123,7 +140,7 @@ func New(cfg *config.Config, st *store.Store) Model {
 		_ = m.tmux.Ensure(context.Background())
 	}
 	m.tabs[tabDashboard] = newDashboard(st, theme, m.tmux.Inherited())
-	m.tabs[tabPlanner] = newPlanner(st, theme)
+	m.tabs[tabPlanner] = newPlanner(st, m.brain, theme)
 	m.tabs[tabProjects] = newProjects(st, theme)
 	m.tabs[tabIdeas] = newIdeas(st, theme)
 	m.tabs[tabTasks] = newTasks(st, theme)
@@ -143,7 +160,7 @@ func (m Model) WithInitialProject(p store.Project) Model {
 
 // promoteIdea opens the Planner prefilled from an idea, marks the idea promoted,
 // and refreshes the Ideas tab. The eventual task carries the idea id (threaded
-// through launchPlanRequestMsg).
+// through launchFromProposalMsg).
 func (m *Model) promoteIdea(idea store.Idea) (tea.Model, tea.Cmd) {
 	if pl, ok := m.tabs[tabPlanner].(*planner); ok {
 		pl.prefill(idea)
@@ -163,6 +180,32 @@ func (m *Model) promoteIdea(idea store.Idea) (tea.Model, tea.Cmd) {
 	return *m, mark
 }
 
+// handleDeleteIdeaRequest opens a confirm overlay; on yes it hard-deletes the
+// idea and refreshes the pile.
+func (m *Model) handleDeleteIdeaRequest(idea store.Idea) (tea.Model, tea.Cmd) {
+	cm := newConfirmModal(m.theme, "Delete this idea?",
+		"permanently remove “"+idea.Title+"” from the idea pile",
+		m.deleteIdeaCmd(idea.ID))
+	cm.SetSize(m.width, m.height)
+	m.overlay = &cm
+	return *m, nil
+}
+
+func (m *Model) deleteIdeaCmd(id int64) tea.Cmd {
+	st := m.store
+	return func() tea.Msg {
+		if err := st.DeleteIdea(ctx(), id); err != nil {
+			return errMsg{err}
+		}
+		_ = st.Emit(ctx(), store.EventIdeaDeleted, map[string]any{"idea": id})
+		items, err := st.ListIdeas(ctx())
+		if err != nil {
+			return errMsg{err}
+		}
+		return ideasLoadedMsg{items}
+	}
+}
+
 // Init kicks off each tab's initial commands.
 func (m Model) Init() tea.Cmd {
 	var cmds []tea.Cmd
@@ -176,18 +219,35 @@ func (m Model) Init() tea.Cmd {
 
 // contentHeight is the rows available to the active tab (minus chrome).
 func (m Model) contentHeight() int {
-	const tabBar, statusBar = 1, 1
-	h := m.height - tabBar - statusBar
+	h := m.height - footerHeight
+	if m.compactChrome() {
+		h--
+	}
 	if h < 0 {
 		h = 0
 	}
 	return h
 }
 
+func (m Model) contentWidth() int {
+	if m.compactChrome() {
+		return m.width
+	}
+	w := m.width - sidebarWidth - 1
+	if w < 0 {
+		w = 0
+	}
+	return w
+}
+
+func (m Model) compactChrome() bool {
+	return m.width < minSidebarWidth
+}
+
 func (m *Model) resizeTabs() {
 	for i := range m.tabs {
 		if m.tabs[i] != nil {
-			m.tabs[i].SetSize(m.width, m.contentHeight())
+			m.tabs[i].SetSize(m.contentWidth(), m.contentHeight())
 		}
 	}
 }
@@ -196,6 +256,7 @@ func (m *Model) resizeTabs() {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width, m.height = ws.Width, ws.Height
+		m.help.Width = ws.Width
 		m.resizeTabs()
 		if m.overlay != nil {
 			m.overlay.SetSize(m.width, m.height)
@@ -222,7 +283,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.String() == "ctrl+c":
 			return m, tea.Quit
-		case msg.String() == "ctrl+o":
+		case key.Matches(msg, m.keys.Attach):
 			// Agents are live panes beside the dashboard. In tmux, ctrl+o moves
 			// focus to the next agent pane; in the standalone fallback it hands
 			// the terminal to tmux to attach.
@@ -244,7 +305,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.tabs[m.active].CapturingInput() {
 			switch {
 			case key.Matches(msg, m.keys.Help):
-				ho := newHelpOverlay(m.theme)
+				ho := newHelpOverlay(m.theme, m.keys)
 				ho.SetSize(m.width, m.height)
 				m.overlay = &ho
 				return m, nil
@@ -281,13 +342,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case promoteIdeaMsg:
 		return (&m).promoteIdea(msg.idea)
-	case launchPlanRequestMsg:
-		if msg.mode == "split" {
-			return (&m).startSplitNow(msg)
-		}
-		return m, m.preparePlanCmd(msg)
-	case planPreparedMsg:
-		return (&m).startPlanSession(msg)
+	case deleteIdeaRequestMsg:
+		return (&m).handleDeleteIdeaRequest(msg.idea)
+	case removeTaskRequestMsg:
+		return (&m).handleRemoveTaskRequest(msg.task)
+	case taskRemovedMsg:
+		return (&m).handleTaskRemoved(msg)
+	case launchFromProposalMsg:
+		return (&m).spawnFromProposal(msg)
 	case planPollMsg:
 		return (&m).handlePlanPoll()
 	case planSplitMsg:
@@ -323,28 +385,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View renders tab bar + active tab content (or modal) + status bar. Live
+// View renders sidebar + active tab content (or modal) + status bar. Live
 // agents run in tmux; the user attaches (ctrl+o) to interact with them.
 func (m Model) View() string {
 	if m.width == 0 {
 		return "loading…"
 	}
 
-	tabBar := m.renderTabBar()
-
-	var content string
-	if m.overlay != nil {
-		content = m.overlay.View()
-	} else {
-		content = m.tabs[m.active].View()
-	}
-
 	status := m.renderStatusBar()
 
-	return lipgloss.JoinVertical(lipgloss.Left, tabBar, content, status)
+	if m.overlay != nil {
+		return lipgloss.JoinVertical(lipgloss.Left, m.overlay.View(), status)
+	}
+
+	if m.compactChrome() {
+		return lipgloss.JoinVertical(lipgloss.Left, m.renderCompactNav(), m.tabs[m.active].View(), status)
+	}
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, m.renderSidebar(), m.renderContentPane())
+	return lipgloss.JoinVertical(lipgloss.Left, body, status)
 }
 
-func (m Model) renderTabBar() string {
+func (m Model) renderCompactNav() string {
 	var cells []string
 	for id := tabID(0); id < numTabs; id++ {
 		label := fmt.Sprintf("%d %s", int(id)+1, tabTitles[id])
@@ -358,9 +420,76 @@ func (m Model) renderTabBar() string {
 	return m.theme.TabBar.Width(m.width).Render(bar)
 }
 
+func (m Model) renderSidebar() string {
+	var lines []string
+	lines = append(lines, m.theme.SidebarLogo.Render("agentree"), m.theme.Subtle.Render("orchestrate agents"), "")
+	for id := tabID(0); id < numTabs; id++ {
+		label := fmt.Sprintf("%d  %-10s", int(id)+1, tabTitles[id])
+		if badge := m.navBadge(id); badge != "" {
+			label = fmt.Sprintf("%-17s %s", label, m.theme.NavBadge.Render(badge))
+		}
+		if id == m.active {
+			lines = append(lines, m.theme.NavActive.Width(sidebarWidth-6).Render("▸ "+label))
+			continue
+		}
+		lines = append(lines, m.theme.NavInactive.Width(sidebarWidth-6).Render("  "+label))
+	}
+	lines = append(lines, "", m.theme.Help.Render("ctrl+n  idea"), m.theme.Help.Render("ctrl+o  attach"), m.theme.Help.Render("tab     next"))
+	return m.theme.Sidebar.Width(fitDim(sidebarWidth - 2)).Height(fitDim(m.contentHeight() - 2)).Render(strings.Join(lines, "\n"))
+}
+
+func (m Model) navBadge(id tabID) string {
+	switch id {
+	case tabDashboard:
+		if live := m.liveSessionCount(); live > 0 {
+			return fmt.Sprintf("%d", live)
+		}
+	case tabProjects:
+		if p, ok := m.tabs[tabProjects].(*projects); ok && len(p.items) > 0 {
+			return fmt.Sprintf("%d", len(p.items))
+		}
+	case tabIdeas:
+		if i, ok := m.tabs[tabIdeas].(*ideas); ok && len(i.items) > 0 {
+			return fmt.Sprintf("%d", len(i.items))
+		}
+	case tabTasks:
+		if t, ok := m.tabs[tabTasks].(*tasks); ok && len(t.items) > 0 {
+			return fmt.Sprintf("%d", len(t.items))
+		}
+	}
+	return ""
+}
+
+func (m Model) renderContentPane() string {
+	header := m.renderPageHeader()
+	content := m.tabs[m.active].View()
+	body := lipgloss.JoinVertical(lipgloss.Left, header, content)
+	return m.theme.ContentPane.Width(fitDim(m.contentWidth() - 2)).Height(fitDim(m.contentHeight() - 2)).Render(body)
+}
+
+func (m Model) renderPageHeader() string {
+	title := tabTitles[m.active]
+	desc := tabDescriptions[m.active]
+	live := ""
+	if m.active == tabDashboard {
+		live = fmt.Sprintf("live: %d", m.liveSessionCount())
+	}
+	left := m.theme.PageHeader.Render(title)
+	right := m.theme.Subtle.Render(desc)
+	if live != "" {
+		right = m.theme.Accent.Render(live)
+	}
+	gap := m.contentWidth() - lipgloss.Width(left) - lipgloss.Width(right) - 4
+	if gap < 1 {
+		gap = 1
+	}
+	return lipgloss.NewStyle().Width(m.contentWidth()).Render(left + strings.Repeat(" ", gap) + right)
+}
+
 func (m Model) renderStatusBar() string {
 	left := m.theme.Accent.Render("agentree")
-	help := m.theme.Help.Render("tab: switch · ctrl+n: idea · q: quit · ?: help")
+	m.help.Width = m.width / 2
+	help := m.help.View(m.keys)
 	msg := m.status
 	if m.err != nil {
 		msg = "error: " + m.err.Error()

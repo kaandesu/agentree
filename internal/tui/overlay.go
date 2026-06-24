@@ -1,6 +1,9 @@
 package tui
 
 import (
+	"strings"
+
+	"github.com/charmbracelet/bubbles/help"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -55,10 +58,16 @@ func (m *confirmModal) View() string {
 // helpOverlay lists global and per-tab keybindings. Any key dismisses it.
 type helpOverlay struct {
 	theme Theme
+	keys  KeyMap
+	help  help.Model
 	w, h  int
 }
 
-func newHelpOverlay(th Theme) helpOverlay { return helpOverlay{theme: th} }
+func newHelpOverlay(th Theme, keys KeyMap) helpOverlay {
+	hlp := help.New()
+	hlp.ShowAll = true
+	return helpOverlay{theme: th, keys: keys, help: hlp}
+}
 
 func (m *helpOverlay) SetSize(w, h int) { m.w, m.h = w, h }
 
@@ -71,29 +80,31 @@ func (m *helpOverlay) Update(msg tea.Msg) (bool, tea.Cmd) {
 
 func (m *helpOverlay) View() string {
 	t := m.theme
+	m.help.Width = m.w - 8
 	section := func(title string, lines ...string) string {
-		s := t.Accent.Render(title) + "\n"
-		for _, l := range lines {
-			s += "  " + l + "\n"
-		}
-		return s
+		return t.Accent.Render(title) + "\n  " + strings.Join(lines, "\n  ") + "\n"
 	}
-	body := t.Title.Render("agentree — keys") + "\n\n" +
-		section("Global",
-			"tab / shift+tab   switch tabs",
-			"1–5               jump to tab (when not editing)",
-			"ctrl+n            capture an idea",
-			"ctrl+o            attach to tmux (live agents)",
-			"?                 this help",
-			"q / ctrl+c        quit") + "\n" +
+	body := t.Title.Render("agentree keys") + "\n\n" +
+		m.help.View(m.keys) + "\n\n" +
 		section("Dashboard",
 			"j / k             select an agent",
 			"d                 load its diff",
 			"p / m / x         open PR · merge · discard",
 			"r                 refresh tasks") + "\n" +
+		section("Planner",
+			"j / k             select project",
+			"enter             compose spec",
+			"ctrl+s / ctrl+f   plan first · split now",
+			"esc               return to project list") + "\n" +
+		section("Projects / Tasks",
+			"j / k             move table selection",
+			"a                 add project",
+			"x                 remove task (Tasks)",
+			"r                 refresh") + "\n" +
 		section("Ideas",
 			"j / k             move · 1–5 set priority",
 			"p                 promote to Planner",
+			"x                 delete idea",
 			"e                 export pile to markdown") + "\n" +
 		t.Help.Render("press any key to close")
 	box := t.ModalBox.Render(body)

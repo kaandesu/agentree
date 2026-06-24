@@ -12,8 +12,22 @@ type KeyMap struct {
 	Tab4        key.Binding
 	Tab5        key.Binding
 	CaptureIdea key.Binding
+	Attach      key.Binding
 	Quit        key.Binding
 	Help        key.Binding
+}
+
+// ShortHelp implements help.KeyMap for the footer.
+func (k KeyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.NextTab, k.CaptureIdea, k.Attach, k.Help, k.Quit}
+}
+
+// FullHelp implements help.KeyMap for expanded global help.
+func (k KeyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{
+		{k.NextTab, k.PrevTab, k.Tab1, k.Tab2, k.Tab3},
+		{k.Tab4, k.Tab5, k.CaptureIdea, k.Attach, k.Help, k.Quit},
+	}
 }
 
 // DefaultKeyMap returns the standard global bindings.
@@ -27,17 +41,21 @@ func DefaultKeyMap() KeyMap {
 			key.WithKeys("shift+tab"),
 			key.WithHelp("shift+tab", "prev"),
 		),
-		Tab1: key.NewBinding(key.WithKeys("1")),
-		Tab2: key.NewBinding(key.WithKeys("2")),
-		Tab3: key.NewBinding(key.WithKeys("3")),
-		Tab4: key.NewBinding(key.WithKeys("4")),
-		Tab5: key.NewBinding(key.WithKeys("5")),
+		Tab1: key.NewBinding(key.WithKeys("1"), key.WithHelp("1", "dashboard")),
+		Tab2: key.NewBinding(key.WithKeys("2"), key.WithHelp("2", "planner")),
+		Tab3: key.NewBinding(key.WithKeys("3"), key.WithHelp("3", "projects")),
+		Tab4: key.NewBinding(key.WithKeys("4"), key.WithHelp("4", "ideas")),
+		Tab5: key.NewBinding(key.WithKeys("5"), key.WithHelp("5", "tasks")),
 		// ctrl+i is byte 0x09 — identical to Tab in every standard terminal, so
 		// terminals deliver it as "tab" and it can never be told apart from the
 		// NextTab binding. Use ctrl+n ("new idea"), a key with its own code.
 		CaptureIdea: key.NewBinding(
 			key.WithKeys("ctrl+n"),
 			key.WithHelp("ctrl+n", "capture idea"),
+		),
+		Attach: key.NewBinding(
+			key.WithKeys("ctrl+o"),
+			key.WithHelp("ctrl+o", "attach"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("ctrl+c", "q"),

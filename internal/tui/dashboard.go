@@ -8,6 +8,7 @@ import (
 	"agentree/internal/orchestrator"
 	"agentree/internal/store"
 
+	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -21,6 +22,7 @@ type dashboard struct {
 	theme     Theme
 	inherited bool // agentree runs as a tmux pane (agents are sibling panes)
 	w, h      int
+	progress  progress.Model
 
 	tasks       []store.Task
 	loaded      bool
@@ -34,7 +36,8 @@ type dashboard struct {
 }
 
 func newDashboard(st *store.Store, th Theme, inherited bool) *dashboard {
-	return &dashboard{store: st, theme: th, inherited: inherited, diffs: map[int][]orchestrator.FileStat{}}
+	p := progress.New(progress.WithSolidFill("87"), progress.WithoutPercentage())
+	return &dashboard{store: st, theme: th, inherited: inherited, progress: p, diffs: map[int][]orchestrator.FileStat{}}
 }
 
 // tasksLoadedMsg carries a refreshed task list.
@@ -163,7 +166,13 @@ func (d *dashboard) selectedWindow() (windowView, bool) {
 	return windowView{}, false
 }
 
-func (d *dashboard) SetSize(w, h int) { d.w, d.h = w, h }
+func (d *dashboard) SetSize(w, h int) {
+	d.w, d.h = w, h
+	d.progress.Width = w - 18
+	if d.progress.Width < 10 {
+		d.progress.Width = 10
+	}
+}
 
 func (d *dashboard) View() string {
 	var b strings.Builder
@@ -209,12 +218,32 @@ func (d *dashboard) View() string {
 	} else if len(d.tasks) == 0 {
 		b.WriteString(d.theme.Subtle.Render("No tasks yet. Press 2 to open the Planner, or ctrl+n to capture an idea."))
 	} else {
+		b.WriteString(d.renderTaskProgress())
+		b.WriteString("\n")
 		for _, t := range d.tasks {
 			b.WriteString(fmt.Sprintf("%s  %-10s  %s\n", statusDot(d.theme, t.Status), t.Status, t.Title))
 		}
 	}
 	b.WriteString("\n" + d.theme.Help.Render("r: refresh tasks"))
 	return lipgloss.NewStyle().Width(d.w).Height(d.h).Padding(1, 2).Render(b.String())
+}
+
+func (d *dashboard) renderTaskProgress() string {
+	done := 0
+	active := 0
+	for _, t := range d.tasks {
+		switch t.Status {
+		case store.StatusDone, store.StatusDiscarded:
+			done++
+		case store.StatusPlanning, store.StatusReady, store.StatusRunning, store.StatusReview:
+			active++
+		}
+	}
+	pct := float64(done) / float64(len(d.tasks))
+	return fmt.Sprintf("%s %s  %s",
+		d.theme.Subtle.Render("completion"),
+		d.progress.ViewAs(pct),
+		d.theme.Help.Render(fmt.Sprintf("%d done · %d active", done, active)))
 }
 
 // renderTree draws plan sessions as roots with their child agents indented.
