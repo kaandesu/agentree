@@ -38,7 +38,8 @@ type Idea struct {
 	ProjectID *int64 // nullable: ideas may be global
 	Title     string
 	Body      string
-	Priority  int // 1 (highest) .. 5 (lowest)
+	Priority  int    // 1 (highest) .. 5 (lowest)
+	Rationale string // brain's one-line justification for the priority
 	Status    string
 	Source    string
 	CreatedAt time.Time

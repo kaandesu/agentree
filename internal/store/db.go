@@ -33,6 +33,9 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := applyMigrations(db); err != nil {
+		return nil, fmt.Errorf("apply migrations: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -114,8 +117,8 @@ func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
 
 func (s *Store) CreateIdea(ctx context.Context, i Idea) (*Idea, error) {
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO ideas (project_id, title, body, priority, status, source) VALUES (?, ?, ?, ?, ?, ?)`,
-		i.ProjectID, i.Title, i.Body, i.Priority, nz(i.Status, "open"), nz(i.Source, "user"))
+		`INSERT INTO ideas (project_id, title, body, priority, rationale, status, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		i.ProjectID, i.Title, i.Body, i.Priority, i.Rationale, nz(i.Status, "open"), nz(i.Source, "user"))
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +129,7 @@ func (s *Store) CreateIdea(ctx context.Context, i Idea) (*Idea, error) {
 
 func (s *Store) ListIdeas(ctx context.Context) ([]Idea, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, project_id, title, body, priority, status, source, created_at
+		`SELECT id, project_id, title, body, priority, rationale, status, source, created_at
 		 FROM ideas WHERE status != 'archived' ORDER BY priority, created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -135,7 +138,7 @@ func (s *Store) ListIdeas(ctx context.Context) ([]Idea, error) {
 	var out []Idea
 	for rows.Next() {
 		var i Idea
-		if err := rows.Scan(&i.ID, &i.ProjectID, &i.Title, &i.Body, &i.Priority, &i.Status, &i.Source, &i.CreatedAt); err != nil {
+		if err := rows.Scan(&i.ID, &i.ProjectID, &i.Title, &i.Body, &i.Priority, &i.Rationale, &i.Status, &i.Source, &i.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, i)
@@ -145,6 +148,20 @@ func (s *Store) ListIdeas(ctx context.Context) ([]Idea, error) {
 
 func (s *Store) SetIdeaPriority(ctx context.Context, id int64, priority int) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE ideas SET priority = ? WHERE id = ?`, priority, id)
+	return err
+}
+
+// UpdateIdeaTriage records both the priority and the brain's rationale, used
+// after the capture modal triages an idea and when the user overrides inline.
+func (s *Store) UpdateIdeaTriage(ctx context.Context, id int64, priority int, rationale string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE ideas SET priority = ?, rationale = ? WHERE id = ?`, priority, rationale, id)
+	return err
+}
+
+// SetIdeaStatus updates an idea's lifecycle status (e.g. "promoted", "archived").
+func (s *Store) SetIdeaStatus(ctx context.Context, id int64, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE ideas SET status = ? WHERE id = ?`, status, id)
 	return err
 }
 
