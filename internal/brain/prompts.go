@@ -63,6 +63,97 @@ each into a crisper, friendlier one-line note for a developer, preserving the
 exact array order and length and keeping the same factual meaning. Respond with
 ONLY a JSON array of strings, same length as the input.`
 
+// planChatSystemPrompt drives the in-TUI multi-turn planning conversation. The
+// AI interrogates the user, then calls the propose_plan tool when ready.
+const planChatSystemPrompt = `You are the planning brain of "agentree", an AI agent multiplexer that
+orchestrates parallel Claude Code agents, each in its own git worktree.
+
+Your job: help the user design a PLAN, then decompose it into a tree of
+FEATURES, each with one or more independently-buildable SUB-TASKS. Each
+sub-task becomes a separate Claude Code agent running in its own worktree.
+
+## Workflow
+
+1. INTERROGATE FIRST. Ask 2-5 focused clarifying questions about:
+   - Scope: what exactly is in vs. out?
+   - Architecture: which layers/modules are involved?
+   - Dependencies: what needs to be done before what?
+   - Constraints: existing patterns, tech stack, things to avoid.
+   Do NOT propose a plan until you have enough information.
+
+2. When you are confident, call the propose_plan tool with a tree of features
+   and sub-tasks. Each sub-task's "prompt" field must be FULLY SELF-CONTAINED:
+   the agent that receives it sees NOTHING else — no plan, no context, just
+   that prompt. Include: the goal, the concrete files/modules to create or
+   modify, the patterns to follow, and the boundaries of the work.
+
+## Splitting rules
+
+- Split along seams that MINIMIZE MERGE CONFLICTS: separate packages, modules,
+  layers, or features. Prefer fewer cleanly-separated sub-tasks over many
+  overlapping ones.
+- A feature may need 1 agent (small, focused) or several (large: e.g. backend
+  API + frontend UI + tests). Use your judgement.
+- If the entire plan is so tightly coupled that splitting would cause conflicts,
+  use a SINGLE feature with a SINGLE sub-task.
+- Keep sub-task count proportional to real complexity. Don't over-split.
+
+## Rules
+
+- Never invent product decisions the user didn't state — ask instead.
+- Each sub-task prompt must tell its agent to explore the existing codebase
+  first and reuse existing patterns/utilities.
+- When ready, call propose_plan. Do NOT output the plan as text — use the tool.`
+
+// proposePlanToolDef is the OpenAI function-calling tool definition used during
+// the planning chat. When the AI is satisfied it has enough context, it calls
+// this tool instead of replying with text.
+var proposePlanToolDef = map[string]any{
+	"type": "function",
+	"function": map[string]any{
+		"name":        "propose_plan",
+		"description": "Propose a decomposition of the plan into features and sub-tasks for parallel agent execution. Call this when you have enough information from the user.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"features": map[string]any{
+					"type":        "array",
+					"description": "Top-level features/work-streams, each containing one or more sub-tasks.",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"title": map[string]any{
+								"type":        "string",
+								"description": "Short title for this feature.",
+							},
+							"sub_tasks": map[string]any{
+								"type":        "array",
+								"description": "Independent sub-tasks within this feature. Each becomes one agent + worktree.",
+								"items": map[string]any{
+									"type": "object",
+									"properties": map[string]any{
+										"title": map[string]any{
+											"type":        "string",
+											"description": "Short title for this sub-task.",
+										},
+										"prompt": map[string]any{
+											"type":        "string",
+											"description": "Fully self-contained build instructions for the agent. The agent sees ONLY this prompt.",
+										},
+									},
+									"required": []string{"title", "prompt"},
+								},
+							},
+						},
+						"required": []string{"title", "sub_tasks"},
+					},
+				},
+			},
+			"required": []string{"features"},
+		},
+	},
+}
+
 // wrapRawSpec is the deterministic fallback used when no LLM is configured. It
 // wraps the user's raw spec with the same interrogation instructions so the
 // app still works (and produces a usable plan-mode prompt) without an API key.

@@ -26,6 +26,41 @@ type SubTask struct {
 	Prompt string `json:"prompt"`
 }
 
+// ChatMessage is one turn in a multi-turn planning conversation.
+type ChatMessage struct {
+	Role    string `json:"role"`    // "system" | "user" | "assistant" | "tool"
+	Content string `json:"content"`
+}
+
+// Feature is a top-level work stream that may contain multiple sub-tasks.
+// A large feature (e.g. "auth") might need 2-3 agents working in parallel on
+// separate slices (OAuth, email/pw, session management).
+type Feature struct {
+	Title    string    `json:"title"`
+	SubTasks []SubTask `json:"sub_tasks"`
+}
+
+// PlanProposal is the AI's structured decomposition of a plan into a tree of
+// features, each containing one or more independently-buildable sub-tasks.
+type PlanProposal struct {
+	Features []Feature `json:"features"`
+}
+
+// TotalAgents returns the total number of sub-tasks (= agents to spawn).
+func (p PlanProposal) TotalAgents() int {
+	n := 0
+	for _, f := range p.Features {
+		n += len(f.SubTasks)
+	}
+	return n
+}
+
+// PlanChatResponse is either a text reply (interrogation) or a proposal.
+type PlanChatResponse struct {
+	Text     string        // non-empty when AI sends a text message
+	Proposal *PlanProposal // non-nil when AI calls the propose_plan tool
+}
+
 // Brain is the capability surface used by the rest of the app.
 type Brain interface {
 	// ExpandSpec turns a raw user spec into a large plan-mode prompt.
@@ -40,6 +75,11 @@ type Brain interface {
 	// crisper, friendlier phrasings, preserving order and count. The stub
 	// returns them unchanged, so suggestions work identically offline.
 	Suggest(ctx context.Context, situations []string) ([]string, error)
+	// PlanChat drives a multi-turn planning conversation. It returns either
+	// a text response (AI is still interrogating) or a PlanProposal (AI
+	// called the propose_plan tool). The caller maintains the message
+	// history and appends each response before the next call.
+	PlanChat(ctx context.Context, messages []ChatMessage) (PlanChatResponse, error)
 	// Available reports whether a real LLM backs this brain.
 	Available() bool
 }
@@ -85,6 +125,27 @@ func (stub) SplitPlan(_ context.Context, plan string) ([]SubTask, error) {
 // Suggest (stub) passes the deterministic rule text through verbatim.
 func (stub) Suggest(_ context.Context, situations []string) ([]string, error) {
 	return situations, nil
+}
+
+// PlanChat (stub) skips interrogation and returns a single-feature proposal
+// wrapping the last user message as one sub-task, so the app works without an
+// API key.
+func (stub) PlanChat(_ context.Context, messages []ChatMessage) (PlanChatResponse, error) {
+	last := "implement the plan"
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+			last = messages[i].Content
+			break
+		}
+	}
+	return PlanChatResponse{
+		Proposal: &PlanProposal{
+			Features: []Feature{{
+				Title:    firstNonEmptyLine(last),
+				SubTasks: []SubTask{singleSubTask(last)},
+			}},
+		},
+	}, nil
 }
 
 func (stub) TriageIdea(_ context.Context, title, body string) (Triage, error) {

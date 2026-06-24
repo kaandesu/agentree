@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -74,6 +75,112 @@ func (b *httpBrain) Suggest(ctx context.Context, situations []string) ([]string,
 		return situations, perr
 	}
 	return refined, nil
+}
+
+func (b *httpBrain) PlanChat(ctx context.Context, messages []ChatMessage) (PlanChatResponse, error) {
+	// Build the messages array: system prompt + conversation history.
+	msgs := make([]map[string]string, 0, len(messages)+1)
+	msgs = append(msgs, map[string]string{"role": "system", "content": planChatSystemPrompt})
+	for _, m := range messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+
+	reqBody := map[string]any{
+		"model":      b.model,
+		"messages":   msgs,
+		"tools":      []any{proposePlanToolDef},
+		"max_tokens": 4096,
+	}
+
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content   *string `json:"content"`
+				ToolCalls []struct {
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := b.do(ctx, "https://api.openai.com/v1/chat/completions",
+		map[string]string{"Authorization": "Bearer " + b.apiKey}, reqBody, &resp); err != nil {
+		return PlanChatResponse{}, err
+	}
+	if resp.Error != nil {
+		return PlanChatResponse{}, fmt.Errorf("openai: %s", resp.Error.Message)
+	}
+	if len(resp.Choices) == 0 {
+		return PlanChatResponse{}, fmt.Errorf("openai: empty response")
+	}
+
+	choice := resp.Choices[0].Message
+
+	// Check for tool call (propose_plan).
+	for _, tc := range choice.ToolCalls {
+		if tc.Function.Name == "propose_plan" {
+			proposal, err := parsePlanProposal(tc.Function.Arguments)
+			if err != nil {
+				return PlanChatResponse{}, fmt.Errorf("failed to parse propose_plan: %w", err)
+			}
+			// Wrap each sub-task prompt with agent operating context.
+			for i := range proposal.Features {
+				for j := range proposal.Features[i].SubTasks {
+					proposal.Features[i].SubTasks[j].Prompt = wrapBuildPrompt(proposal.Features[i].SubTasks[j].Prompt)
+				}
+			}
+			return PlanChatResponse{Proposal: &proposal}, nil
+		}
+	}
+
+	// Text response (interrogation).
+	text := ""
+	if choice.Content != nil {
+		text = *choice.Content
+	}
+	return PlanChatResponse{Text: text}, nil
+}
+
+// parsePlanProposal extracts a PlanProposal from the function call arguments.
+func parsePlanProposal(raw string) (PlanProposal, error) {
+	var p PlanProposal
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return PlanProposal{}, err
+	}
+	// Drop empty features/sub-tasks.
+	var features []Feature
+	for _, f := range p.Features {
+		var subs []SubTask
+		for _, st := range f.SubTasks {
+			st.Title = strings.TrimSpace(st.Title)
+			st.Prompt = strings.TrimSpace(st.Prompt)
+			if st.Prompt != "" {
+				if st.Title == "" {
+					st.Title = firstNonEmptyLine(st.Prompt)
+				}
+				subs = append(subs, st)
+			}
+		}
+		if len(subs) > 0 {
+			f.SubTasks = subs
+			f.Title = strings.TrimSpace(f.Title)
+			if f.Title == "" {
+				f.Title = subs[0].Title
+			}
+			features = append(features, f)
+		}
+	}
+	if len(features) == 0 {
+		return PlanProposal{}, fmt.Errorf("proposal contained no usable features")
+	}
+	p.Features = features
+	return p, nil
 }
 
 // chat dispatches to the configured provider and returns the assistant text.
