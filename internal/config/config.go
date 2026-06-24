@@ -81,7 +81,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		BrainProvider: ProviderOpenAI,
-		BrainModel:    "gpt-4o",
+		BrainModel:    "gpt-4.1",
 		WorktreeRoot:  wtRoot,
 		DBPath:        filepath.Join(dir, "agentree.db"),
 		TmuxSocket:    "agentree",
