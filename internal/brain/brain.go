@@ -36,6 +36,10 @@ type Brain interface {
 	// sub-tasks. It always returns at least one sub-task (the whole plan) so
 	// the caller can proceed even when no real LLM is configured.
 	SplitPlan(ctx context.Context, plan string) ([]SubTask, error)
+	// Suggest refines the supervisor's deterministic suggestion texts into
+	// crisper, friendlier phrasings, preserving order and count. The stub
+	// returns them unchanged, so suggestions work identically offline.
+	Suggest(ctx context.Context, situations []string) ([]string, error)
 	// Available reports whether a real LLM backs this brain.
 	Available() bool
 }
@@ -76,6 +80,11 @@ func (stub) ExpandSpec(_ context.Context, raw string) (string, error) {
 // parallel-safety — so it returns the whole plan as a single build sub-task.
 func (stub) SplitPlan(_ context.Context, plan string) ([]SubTask, error) {
 	return []SubTask{singleSubTask(plan)}, nil
+}
+
+// Suggest (stub) passes the deterministic rule text through verbatim.
+func (stub) Suggest(_ context.Context, situations []string) ([]string, error) {
+	return situations, nil
 }
 
 func (stub) TriageIdea(_ context.Context, title, body string) (Triage, error) {
@@ -154,6 +163,21 @@ func parseSplit(s string) ([]SubTask, error) {
 	}
 	if len(out) == 0 {
 		return nil, errors.New("split produced no usable sub-tasks")
+	}
+	return out, nil
+}
+
+// parseStringArray extracts a []string from a model response that should be a
+// JSON array, tolerating code fences / surrounding prose.
+func parseStringArray(s string) ([]string, error) {
+	start := strings.Index(s, "[")
+	end := strings.LastIndex(s, "]")
+	if start < 0 || end <= start {
+		return nil, errors.New("no JSON array in response")
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(s[start:end+1]), &out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

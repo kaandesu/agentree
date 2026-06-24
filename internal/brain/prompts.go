@@ -56,6 +56,13 @@ where 1 is highest priority (do soon, high impact/urgency) and 5 is lowest
 (someday/maybe). Consider impact, urgency, effort, and dependencies. Respond
 with ONLY a compact JSON object: {"priority": <1-5>, "rationale": "<one sentence>"}.`
 
+// suggestSystemPrompt refines the supervisor's deterministic suggestion lines.
+const suggestSystemPrompt = `You are a terminal app's lightweight supervisor. You receive a JSON array of
+plain suggestion strings describing the state of parallel coding agents. Rewrite
+each into a crisper, friendlier one-line note for a developer, preserving the
+exact array order and length and keeping the same factual meaning. Respond with
+ONLY a JSON array of strings, same length as the input.`
+
 // wrapRawSpec is the deterministic fallback used when no LLM is configured. It
 // wraps the user's raw spec with the same interrogation instructions so the
 // app still works (and produces a usable plan-mode prompt) without an API key.

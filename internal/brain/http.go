@@ -60,6 +60,22 @@ func (b *httpBrain) SplitPlan(ctx context.Context, plan string) ([]SubTask, erro
 	return subs, nil
 }
 
+func (b *httpBrain) Suggest(ctx context.Context, situations []string) ([]string, error) {
+	if len(situations) == 0 {
+		return situations, nil
+	}
+	in, _ := json.Marshal(situations)
+	out, err := b.chat(ctx, suggestSystemPrompt, string(in), 1024)
+	if err != nil {
+		return situations, err // fail soft: keep deterministic phrasing
+	}
+	refined, perr := parseStringArray(out)
+	if perr != nil || len(refined) != len(situations) {
+		return situations, perr
+	}
+	return refined, nil
+}
+
 // chat dispatches to the configured provider and returns the assistant text.
 func (b *httpBrain) chat(ctx context.Context, system, user string, maxTokens int) (string, error) {
 	switch b.provider {
