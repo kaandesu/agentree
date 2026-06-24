@@ -35,6 +35,7 @@ type session struct {
 	dead      bool // tmux window's command exited
 	splitting bool // an ingest+split command is in flight
 	ingested  bool // plan captured and split kicked off (terminal for plan)
+	failed    bool // plan window died without ever producing a plan (terminal)
 }
 
 // plansDir returns ~/.claude/plans, where Claude Code persists plan files.

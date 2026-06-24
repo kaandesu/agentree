@@ -184,6 +184,10 @@ func (m Model) ingestSplitCmd(s *session) tea.Cmd {
 		if planPath == "" {
 			planPath = findNewPlan(plans, snap, launchAt)
 		}
+		// The plan file (~/.claude/plans/<slug>.md) is the only clean source:
+		// plan mode is read-only, so claude persists the plan there rather than
+		// to the repo. We never scrape the live pane — that's TUI chrome, not
+		// markdown — so a missing file means "no plan yet", not garbage to split.
 		var planText string
 		if planPath != "" {
 			if b, err := os.ReadFile(planPath); err == nil {
@@ -191,12 +195,8 @@ func (m Model) ingestSplitCmd(s *session) tea.Cmd {
 			}
 		}
 		if strings.TrimSpace(planText) == "" {
-			// Fall back to scraping the plan from the live window's output.
-			planText, _ = tm.Capture(c, winID)
-		}
-		if strings.TrimSpace(planText) == "" {
 			return planSplitMsg{planSessionID: sessID, planTaskID: taskID,
-				err: fmt.Errorf("no plan content yet — attach and let claude present the plan")}
+				err: fmt.Errorf("no plan file yet — attach and let claude present the plan")}
 		}
 
 		_ = st.SetTaskPlanReady(c, taskID, planPath)
@@ -226,12 +226,18 @@ func (m Model) ingestSplitCmd(s *session) tea.Cmd {
 func (m *Model) applyPlanSplit(msg planSplitMsg) (tea.Model, tea.Cmd) {
 	ps := m.sessions[msg.planSessionID]
 	if msg.err != nil && len(msg.spawns) == 0 {
-		// Nothing ingested (e.g. detached before the plan was ready). Leave the
-		// plan session live so the user can re-attach and try again.
 		if ps != nil {
 			ps.splitting = false
+			if ps.dead {
+				// Window exited without ever producing a plan: terminal, so the
+				// poll loop stops retrying it.
+				ps.failed = true
+				m.status = "plan session ended without a plan — relaunch from the Planner"
+			} else {
+				// Detached before the plan was ready; leave it live to retry.
+				m.status = msg.err.Error()
+			}
 		}
-		m.status = msg.err.Error()
 		return *m, nil
 	}
 
@@ -278,7 +284,7 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 		if !ok || w.Dead {
 			s.dead = true
 		}
-		if s.kind == "plan" && !s.ingested {
+		if s.kind == "plan" && !s.ingested && !s.failed {
 			if s.planPath == "" {
 				if p := findNewPlan(s.plansDir, s.snapshot, s.launchAt); p != "" {
 					s.planPath = p
@@ -324,7 +330,7 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 func (m *Model) handleAttachReturned() (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	for _, s := range m.sessions {
-		if s.kind == "plan" && !s.ingested && !s.splitting {
+		if s.kind == "plan" && !s.ingested && !s.failed && !s.splitting {
 			s.splitting = true
 			cmds = append(cmds, m.ingestSplitCmd(s))
 		}
