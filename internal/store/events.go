@@ -10,6 +10,8 @@ import (
 // typed convenience that JSON-encodes a payload map.
 const (
 	EventIdeaAdded       = "idea.added"
+	EventIdeaDeleted     = "idea.deleted"
+	EventTaskRemoved     = "task.removed"
 	EventPlanReady       = "plan.ready"
 	EventPlanSplit       = "plan.split"
 	EventWorktreeCreated = "worktree.created"

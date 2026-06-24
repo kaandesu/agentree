@@ -165,6 +165,12 @@ func (s *Store) SetIdeaStatus(ctx context.Context, id int64, status string) erro
 	return err
 }
 
+// DeleteIdea permanently removes an idea row.
+func (s *Store) DeleteIdea(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ideas WHERE id = ?`, id)
+	return err
+}
+
 // ---- Tasks ----
 
 func (s *Store) CreateTask(ctx context.Context, t Task) (*Task, error) {
