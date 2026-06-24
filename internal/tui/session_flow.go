@@ -204,6 +204,11 @@ func (m *Model) handlePlanPoll() (tea.Model, tea.Cmd) {
 				if ok {
 					code = w.Status
 				}
+				if code == 0 {
+					m.status = "agent finished: " + s.title + " — review & ship on the Dashboard (M to merge+clean)"
+				} else {
+					m.status = fmt.Sprintf("agent exited (%d): %s", code, s.title)
+				}
 				st := m.store
 				title, branch, sid := s.title, s.branch, s.id
 				cmds = append(cmds, func() tea.Msg {

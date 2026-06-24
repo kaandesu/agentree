@@ -41,6 +41,8 @@ const (
 	tabProjects
 	tabIdeas
 	tabTasks
+	tabGit
+	tabIssues
 	numTabs
 )
 
@@ -50,6 +52,8 @@ var tabTitles = map[tabID]string{
 	tabProjects:  "Projects",
 	tabIdeas:     "Ideas",
 	tabTasks:     "Tasks",
+	tabGit:       "Git",
+	tabIssues:    "Issues",
 }
 
 var tabDescriptions = map[tabID]string{
@@ -58,6 +62,8 @@ var tabDescriptions = map[tabID]string{
 	tabProjects:  "registered repos",
 	tabIdeas:     "triaged backlog",
 	tabTasks:     "task status",
+	tabGit:       "lazygit",
+	tabIssues:    "github issues",
 }
 
 const (
@@ -105,6 +111,9 @@ type Model struct {
 	sessions    map[int]*session
 	lastSession int
 	nextSessID  int
+	// activeProject is the repo the Git (lazygit) and Issues tabs target. Set
+	// from a repo argument, or when a project is chosen in the Planner/Projects.
+	activeProject *store.Project
 	// polling is true while a single planPollMsg tick-loop is live, so the
 	// several code paths that want polling don't spawn parallel loops.
 	polling bool
@@ -144,7 +153,28 @@ func New(cfg *config.Config, st *store.Store) Model {
 	m.tabs[tabProjects] = newProjects(st, theme)
 	m.tabs[tabIdeas] = newIdeas(st, theme)
 	m.tabs[tabTasks] = newTasks(st, theme)
+	m.tabs[tabGit] = newGitTab(theme)
+	m.tabs[tabIssues] = newIssues(theme)
 	return m
+}
+
+// setActiveProject records the active project and pushes it to the Git and
+// Issues tabs, returning their resulting commands (issue fetch / lazygit start).
+func (m *Model) setActiveProject(p store.Project) tea.Cmd {
+	pp := p
+	m.activeProject = &pp
+	var cmds []tea.Cmd
+	if g, ok := m.tabs[tabGit].(*gittab); ok {
+		if c := g.setProject(pp); c != nil {
+			cmds = append(cmds, c)
+		}
+	}
+	if is, ok := m.tabs[tabIssues].(*issues); ok {
+		if c := is.setProject(pp); c != nil {
+			cmds = append(cmds, c)
+		}
+	}
+	return tea.Batch(cmds...)
 }
 
 // WithInitialProject focuses the Planner on a project at startup (used when
@@ -154,9 +184,16 @@ func (m Model) WithInitialProject(p store.Project) Model {
 	if pl, ok := m.tabs[tabPlanner].(*planner); ok {
 		pl.selectProject(p)
 	}
+	// Point the Git/Issues tabs at it too. Their lazy commands fire from Init /
+	// the first Update once a size is known, so the discarded cmd here is fine.
+	_ = (&m).setActiveProject(p)
 	m.status = "project: " + p.Name
 	return m
 }
+
+// projectSelectedMsg announces the user picked a project (in the Planner or
+// Projects tab); the root records it as the active project for Git/Issues.
+type projectSelectedMsg struct{ project store.Project }
 
 // promoteIdea opens the Planner prefilled from an idea, marks the idea promoted,
 // and refreshes the Ideas tab. The eventual task carries the idea id (threaded
@@ -244,10 +281,37 @@ func (m Model) compactChrome() bool {
 	return m.width < minSidebarWidth
 }
 
+// tabInnerWidth/tabInnerHeight are the real dimensions a tab renders into. In
+// the normal (non-compact) layout renderContentPane wraps the tab in a bordered
+// box (2 cols / 2 rows) under a 1-line page header, so tabs must be sized to the
+// area that actually remains — otherwise their content overflows the frame and
+// the whole screen scrolls off the bottom. Compact mode has no border/header.
+func (m Model) tabInnerWidth() int {
+	if m.compactChrome() {
+		return m.contentWidth()
+	}
+	w := m.contentWidth() - 2
+	if w < 0 {
+		w = 0
+	}
+	return w
+}
+
+func (m Model) tabInnerHeight() int {
+	if m.compactChrome() {
+		return m.contentHeight()
+	}
+	h := m.contentHeight() - 3 // page header (1) + border (2)
+	if h < 0 {
+		h = 0
+	}
+	return h
+}
+
 func (m *Model) resizeTabs() {
 	for i := range m.tabs {
 		if m.tabs[i] != nil {
-			m.tabs[i].SetSize(m.contentWidth(), m.contentHeight())
+			m.tabs[i].SetSize(m.tabInnerWidth(), m.tabInnerHeight())
 		}
 	}
 }
@@ -326,11 +390,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case key.Matches(msg, m.keys.Tab5):
 				m.active = tabTasks
 				return m, nil
+			case key.Matches(msg, m.keys.Tab6):
+				m.active = tabGit
+				return m, nil
+			case key.Matches(msg, m.keys.Tab7):
+				m.active = tabIssues
+				return m, nil
 			}
 		}
 	}
 
-	// Root-level messages.
+	// Root-level messages. defaultProjectCmd carries any active-project side
+	// effect for messages (e.g. projectsLoadedMsg) that still broadcast below.
+	var defaultProjectCmd tea.Cmd
 	switch msg := msg.(type) {
 	case errMsg:
 		m.err = msg.err
@@ -340,6 +412,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		m.status = msg.text
 		return m, nil
+	case projectSelectedMsg:
+		return m, (&m).setActiveProject(msg.project)
+	case projectsLoadedMsg:
+		// Default the active project to the sole registered repo so the Git and
+		// Issues tabs work out of the box. Falls through to the broadcast below.
+		if m.activeProject == nil && len(msg.items) == 1 {
+			defaultProjectCmd = (&m).setActiveProject(msg.items[0])
+		}
 	case promoteIdeaMsg:
 		return (&m).promoteIdea(msg.idea)
 	case deleteIdeaRequestMsg:
@@ -375,6 +455,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmds []tea.Cmd
+	if defaultProjectCmd != nil {
+		cmds = append(cmds, defaultProjectCmd)
+	}
 	for i := range m.tabs {
 		updated, cmd := m.tabs[i].Update(msg)
 		m.tabs[i] = updated
@@ -479,11 +562,14 @@ func (m Model) renderPageHeader() string {
 	if live != "" {
 		right = m.theme.Accent.Render(live)
 	}
-	gap := m.contentWidth() - lipgloss.Width(left) - lipgloss.Width(right) - 4
+	// Match the bordered content box's inner width so the header doesn't wrap and
+	// push the body down a row.
+	hw := m.tabInnerWidth()
+	gap := hw - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
 	}
-	return lipgloss.NewStyle().Width(m.contentWidth()).Render(left + strings.Repeat(" ", gap) + right)
+	return lipgloss.NewStyle().Width(hw).Render(left + strings.Repeat(" ", gap) + right)
 }
 
 func (m Model) renderStatusBar() string {

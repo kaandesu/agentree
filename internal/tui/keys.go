@@ -11,6 +11,8 @@ type KeyMap struct {
 	Tab3        key.Binding
 	Tab4        key.Binding
 	Tab5        key.Binding
+	Tab6        key.Binding
+	Tab7        key.Binding
 	CaptureIdea key.Binding
 	Attach      key.Binding
 	Quit        key.Binding
@@ -46,6 +48,8 @@ func DefaultKeyMap() KeyMap {
 		Tab3: key.NewBinding(key.WithKeys("3"), key.WithHelp("3", "projects")),
 		Tab4: key.NewBinding(key.WithKeys("4"), key.WithHelp("4", "ideas")),
 		Tab5: key.NewBinding(key.WithKeys("5"), key.WithHelp("5", "tasks")),
+		Tab6: key.NewBinding(key.WithKeys("6"), key.WithHelp("6", "git")),
+		Tab7: key.NewBinding(key.WithKeys("7"), key.WithHelp("7", "issues")),
 		// ctrl+i is byte 0x09 — identical to Tab in every standard terminal, so
 		// terminals deliver it as "tab" and it can never be told apart from the
 		// NextTab binding. Use ctrl+n ("new idea"), a key with its own code.

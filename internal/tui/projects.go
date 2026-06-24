@@ -114,6 +114,12 @@ func (p *projects) Update(msg tea.Msg) (tab, tea.Cmd) {
 			return p, textinput.Blink
 		case "r":
 			return p, p.refresh()
+		case "enter":
+			if idx := p.table.Cursor(); idx >= 0 && idx < len(p.items) {
+				sel := p.items[idx]
+				return p, func() tea.Msg { return projectSelectedMsg{project: sel} }
+			}
+			return p, nil
 		}
 		var cmd tea.Cmd
 		p.table, cmd = p.table.Update(msg)
@@ -176,7 +182,7 @@ func (p *projects) View() string {
 	} else {
 		b.WriteString(p.table.View())
 	}
-	b.WriteString("\n" + p.theme.Help.Render("a: add project · r: refresh"))
+	b.WriteString("\n" + p.theme.Help.Render("a: add project · enter: set active (git/issues) · r: refresh"))
 	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(b.String())
 }
 

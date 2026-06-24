@@ -126,6 +126,8 @@ func (d *dashboard) handleKey(msg tea.KeyMsg) (tab, tea.Cmd) {
 		return d, d.shipSelected("pr")
 	case "m":
 		return d, d.shipSelected("merge")
+	case "M":
+		return d, d.shipSelected("merge_clean")
 	case "x":
 		return d, d.shipSelected("discard")
 	}
@@ -203,7 +205,7 @@ func (d *dashboard) View() string {
 		if d.inherited {
 			focusHelp = "ctrl+o / ctrl+b ←→: focus a pane"
 		}
-		b.WriteString(d.theme.Help.Render("j/k: select agent · d: diff · p: PR · m: merge · x: discard · " + focusHelp))
+		b.WriteString(d.theme.Help.Render("j/k: select agent · d: diff · p: PR · m: merge · M: merge+clean · x: discard · " + focusHelp))
 		if d.attach != "" {
 			b.WriteString("\n" + d.theme.Subtle.Render("attach elsewhere: "+d.attach))
 		}
@@ -316,6 +318,8 @@ func (d *dashboard) meta(w windowView) string {
 	if w.dead {
 		if w.status != 0 {
 			parts = append(parts, fmt.Sprintf("exit %d", w.status))
+		} else if w.kind == "agent" {
+			parts = append(parts, d.theme.StatusOk.Render("ready ✓ — ship it"))
 		} else {
 			parts = append(parts, "exited")
 		}

@@ -42,11 +42,12 @@ type planner struct {
 	pendingIdeaID *int64
 
 	// Chat state (phaseChat).
-	messages []brain.ChatMessage  // conversation history (user + assistant turns)
-	proposal *brain.PlanProposal  // current proposal (nil until AI calls propose_plan)
-	input    textarea.Model       // chat input box
-	vp       viewport.Model       // scrollable chat messages
-	thinking bool                 // waiting for AI response
+	messages []brain.ChatMessage // conversation history (user + assistant turns)
+	proposal *brain.PlanProposal // current proposal (nil until AI calls propose_plan)
+	showPlan bool                // proposal modal is open over the chat
+	input    textarea.Model      // chat input box
+	vp       viewport.Model      // scrollable chat messages
+	thinking bool                // waiting for AI response
 }
 
 // --- messages emitted by the planner ---
@@ -137,7 +138,19 @@ func (p *planner) prefill(idea store.Idea) {
 func (p *planner) initChat() {
 	p.messages = nil
 	p.proposal = nil
+	p.showPlan = false
 	p.thinking = false
+	// Seed a hidden system message with deterministic project context so the AI
+	// knows what it's planning for (README/manifest/root layout). It isn't shown
+	// in the transcript (renderMessages skips non-user/assistant roles).
+	if p.selected != nil {
+		if c := buildProjectContext(p.selected.RepoPath); c != "" {
+			p.messages = []brain.ChatMessage{{Role: "system", Content: c}}
+		}
+	}
+	if !p.brain.Available() {
+		p.notice = "no API key found — using offline stub (set OPENAI_API_KEY in .env for real planning)"
+	}
 	p.input.Focus()
 	p.updateViewport()
 }
@@ -173,8 +186,9 @@ func (p *planner) Update(msg tea.Msg) (tab, tea.Cmd) {
 	case chatProposalMsg:
 		p.thinking = false
 		p.proposal = &msg.proposal
+		p.showPlan = true // pop the plan modal over the chat
 		// Add a synthetic assistant message summarizing the proposal.
-		summary := fmt.Sprintf("I've prepared a plan with %d feature(s) and %d agent(s). Review the tree on the right, then press ctrl+enter to launch — or keep chatting to refine.",
+		summary := fmt.Sprintf("I've prepared a plan with %d feature(s) and %d agent(s). It's shown in the plan modal — press ctrl+l to launch, esc to keep chatting, ctrl+p to reopen it.",
 			len(msg.proposal.Features), msg.proposal.TotalAgents())
 		p.messages = append(p.messages, brain.ChatMessage{Role: "assistant", Content: summary})
 		p.updateViewport()
@@ -221,7 +235,9 @@ func (p *planner) updateSelect(msg tea.KeyMsg) (tab, tea.Cmd) {
 		p.phase = phaseChat
 		p.notice = ""
 		p.initChat()
-		return p, textarea.Blink
+		return p, tea.Batch(textarea.Blink, func() tea.Msg {
+			return projectSelectedMsg{project: sel}
+		})
 	}
 	var cmd tea.Cmd
 	p.list, cmd = p.list.Update(msg)
@@ -231,24 +247,9 @@ func (p *planner) updateSelect(msg tea.KeyMsg) (tab, tea.Cmd) {
 
 func (p *planner) updateChat(msg tea.KeyMsg) (tab, tea.Cmd) {
 	switch msg.String() {
-	case "esc":
-		p.phase = phaseSelectProject
-		p.input.Blur()
-		p.resetChat()
-		return p, nil
-	case "ctrl+s":
-		// Send message to AI.
-		text := strings.TrimSpace(p.input.Value())
-		if text == "" || p.thinking || p.selected == nil {
-			return p, nil
-		}
-		p.messages = append(p.messages, brain.ChatMessage{Role: "user", Content: text})
-		p.input.Reset()
-		p.thinking = true
-		p.updateViewport()
-		return p, p.planChatCmd()
-	case "ctrl+enter":
-		// Confirm proposal and launch agents.
+	case "ctrl+l":
+		// Confirm proposal and launch agents — works whether the modal is open or
+		// not. (ctrl+enter is unreliable; most terminals deliver it as Enter.)
 		if p.proposal == nil || p.selected == nil {
 			return p, nil
 		}
@@ -264,6 +265,44 @@ func (p *planner) updateChat(msg tea.KeyMsg) (tab, tea.Cmd) {
 				ideaID:   ideaID,
 			}
 		}
+	case "ctrl+p":
+		// Reopen the plan modal after dismissing it.
+		if p.proposal != nil {
+			p.showPlan = true
+		}
+		return p, nil
+	case "esc":
+		if p.showPlan {
+			p.showPlan = false // close the modal, keep chatting
+			return p, nil
+		}
+		p.phase = phaseSelectProject
+		p.input.Blur()
+		p.resetChat()
+		return p, nil
+	}
+	// While the plan modal is open it owns the view; swallow other keys so stray
+	// typing doesn't land in the hidden input box.
+	if p.showPlan {
+		return p, nil
+	}
+	switch msg.String() {
+	case "ctrl+s":
+		// Send message to AI.
+		text := strings.TrimSpace(p.input.Value())
+		if text == "" || p.thinking || p.selected == nil {
+			return p, nil
+		}
+		p.messages = append(p.messages, brain.ChatMessage{Role: "user", Content: text})
+		p.input.Reset()
+		p.thinking = true
+		p.updateViewport()
+		return p, p.planChatCmd()
+	case "pgup", "pgdown", "ctrl+u", "ctrl+d":
+		// Scroll the chat history without disturbing the input box.
+		var cmd tea.Cmd
+		p.vp, cmd = p.vp.Update(msg)
+		return p, cmd
 	}
 	var cmd tea.Cmd
 	p.input, cmd = p.input.Update(msg)
@@ -299,6 +338,7 @@ func (p *planner) firstUserMessage() string {
 func (p *planner) resetChat() {
 	p.messages = nil
 	p.proposal = nil
+	p.showPlan = false
 	p.thinking = false
 	p.input.Reset()
 	p.selected = nil
@@ -326,8 +366,10 @@ func (p *planner) refreshProjectList() {
 // updateViewport rebuilds the chat content and sizes the viewport.
 func (p *planner) updateViewport() {
 	chatW := p.chatWidth()
-	inputH := 5 // textarea + help line + padding
-	vpH := p.h - inputH - 3
+	// p.h is the inner content height the root grants this tab. Reserve rows for
+	// the outer vertical padding (2), header (1), two separators (2), the 3-line
+	// input box, and the help line (1) — everything else is scrollable history.
+	vpH := p.h - 9
 	if vpH < 1 {
 		vpH = 1
 	}
@@ -337,16 +379,10 @@ func (p *planner) updateViewport() {
 	p.vp.GotoBottom()
 }
 
+// chatWidth is always full width now — the proposal shows in a centered modal
+// instead of a side panel, so the chat never reflows when a plan arrives.
 func (p *planner) chatWidth() int {
-	if p.proposal != nil {
-		// 60% for chat, 40% for tree panel.
-		return fitDim((p.w - 4) * 60 / 100)
-	}
 	return fitDim(p.w - 4)
-}
-
-func (p *planner) treeWidth() int {
-	return fitDim(p.w - 4 - p.chatWidth() - 1)
 }
 
 func (p *planner) View() string {
@@ -370,25 +406,26 @@ func (p *planner) View() string {
 
 	// Chat phase.
 	header := p.theme.Subtle.Render(fmt.Sprintf("Project: %s", p.selected.Name))
+	if p.notice != "" {
+		header += "\n" + p.theme.Accent.Render(p.notice)
+	}
+
+	// The plan modal, when open, replaces the chat with a centered box (no
+	// reflow of the underlying chat width).
+	if p.showPlan && p.proposal != nil {
+		return p.renderPlanModal()
+	}
 
 	// Chat column: viewport + input + help.
 	chatContent := p.vp.View() + "\n" + p.input.View() + "\n" + p.chatHelp()
 	chatCol := lipgloss.NewStyle().Width(p.chatWidth()).Render(header + "\n" + chatContent)
-
-	if p.proposal == nil {
-		return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(chatCol)
-	}
-
-	// Split view: chat left, tree right.
-	treeCol := p.renderTree()
-	body := lipgloss.JoinHorizontal(lipgloss.Top, chatCol, " ", treeCol)
-	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(body)
+	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(chatCol)
 }
 
 func (p *planner) chatHelp() string {
-	help := "ctrl+s: send"
+	help := "ctrl+s: send · pgup/pgdn: scroll"
 	if p.proposal != nil {
-		help += " · ctrl+enter: confirm & launch"
+		help += " · ctrl+l: launch · ctrl+p: plan"
 	}
 	help += " · esc: back"
 	return p.theme.Help.Render(help)
@@ -396,7 +433,13 @@ func (p *planner) chatHelp() string {
 
 // renderMessages formats the chat history for the viewport.
 func (p *planner) renderMessages(width int) string {
-	if len(p.messages) == 0 && !p.thinking {
+	visible := 0
+	for _, m := range p.messages {
+		if m.Role == "user" || m.Role == "assistant" {
+			visible++
+		}
+	}
+	if visible == 0 && !p.thinking {
 		return p.theme.Subtle.Render("Type your spec and press ctrl+s to start the conversation...")
 	}
 
@@ -437,21 +480,29 @@ func (p *planner) renderMessages(width int) string {
 	}
 
 	if p.thinking {
-		lines = append(lines, aiStyle.Render("[ai] ")+ p.theme.Subtle.Render("thinking..."))
+		lines = append(lines, aiStyle.Render("[ai] ")+p.theme.Subtle.Render("thinking..."))
 	}
 
 	return strings.Join(lines, "\n")
 }
 
-// renderTree draws the feature/sub-task tree panel.
-func (p *planner) renderTree() string {
+// renderPlanModal draws the proposed feature/sub-task tree as a centered modal
+// box over the chat area, so reviewing a plan never reflows the conversation.
+func (p *planner) renderPlanModal() string {
 	if p.proposal == nil {
 		return ""
 	}
-	tw := p.treeWidth()
-	var b strings.Builder
+	boxW := p.w - 8
+	if boxW > 84 {
+		boxW = 84
+	}
+	if boxW < 24 {
+		boxW = 24
+	}
+	innerW := boxW - 6 // minus border + padding, for wrapping sub-task titles
 
-	title := fmt.Sprintf("Features (%d features, %d agents)",
+	var b strings.Builder
+	title := fmt.Sprintf("Proposed plan — %d feature(s), %d agent(s)",
 		len(p.proposal.Features), p.proposal.TotalAgents())
 	b.WriteString(p.theme.Title.Render(title))
 	b.WriteString("\n\n")
@@ -470,29 +521,24 @@ func (p *planner) renderTree() string {
 			if j == len(f.SubTasks)-1 {
 				connector = "└─"
 			}
-			line := treeGlyph.Render(connector) + " " + st.Title
-			// Truncate if too wide.
-			if lipgloss.Width(line) > tw-2 {
-				line = line[:tw-5] + "..."
-			}
-			b.WriteString("   " + line + "\n")
+			tag := treeGlyph.Render(connector) + " "
+			body := lipgloss.NewStyle().Width(innerW - lipgloss.Width(tag) - 3).Render(st.Title)
+			b.WriteString("   " + tag + body + "\n")
 		}
 		if i < len(p.proposal.Features)-1 {
 			b.WriteString("\n")
 		}
 	}
+	b.WriteString("\n")
+	b.WriteString(p.theme.Help.Render("ctrl+l: launch · esc: keep chatting"))
 
-	vpH := p.h - 8
-	if vpH < 1 {
-		vpH = 1
-	}
-	return lipgloss.NewStyle().
-		Width(tw).
-		Height(vpH).
+	box := lipgloss.NewStyle().
+		Width(boxW).
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colBorder).
-		Padding(1, 1).
+		BorderForeground(colActive).
+		Padding(1, 2).
 		Render(b.String())
+	return lipgloss.Place(p.w, p.h, lipgloss.Center, lipgloss.Center, box)
 }
 
 // CapturingInput implements tab; the planner always handles its own keys.

@@ -50,6 +50,9 @@ func (m *Model) handleShipRequest(sessionID int, action string) (tea.Model, tea.
 	case "merge":
 		prompt = "Merge into " + s.baseBranch + "?"
 		detail = fmt.Sprintf("git merge --no-ff %s (aborts on conflict)", s.branch)
+	case "merge_clean":
+		prompt = "Merge into " + s.baseBranch + " and clean up?"
+		detail = fmt.Sprintf("merge %s, then remove the worktree, delete the branch, and kill the window", s.branch)
 	case "discard":
 		prompt = "Discard this worktree?"
 		detail = fmt.Sprintf("remove %s, delete branch %s, kill the tmux window", s.dir, s.branch)
@@ -83,6 +86,15 @@ func (m *Model) shipActionCmd(sessionID int, action string) tea.Cmd {
 			return shipDoneMsg{sessionID: sessionID, action: action, url: url, err: err}
 		case "merge":
 			err := ship.Merge(c, repo, base, branch)
+			return shipDoneMsg{sessionID: sessionID, action: action, err: err}
+		case "merge_clean":
+			// Merge first; only tear the worktree down if it landed cleanly, so a
+			// conflict never loses the agent's branch.
+			if err := ship.Merge(c, repo, base, branch); err != nil {
+				return shipDoneMsg{sessionID: sessionID, action: action, err: err}
+			}
+			err := ship.Discard(c, repo, worktree, branch)
+			_ = tm.KillWindow(c, winID) // best-effort window cleanup
 			return shipDoneMsg{sessionID: sessionID, action: action, err: err}
 		case "discard":
 			err := ship.Discard(c, repo, worktree, branch)
@@ -178,6 +190,13 @@ func (m *Model) handleShipDone(msg shipDoneMsg) (tea.Model, tea.Cmd) {
 		if s := m.sessions[msg.sessionID]; s != nil && m.soleAgentForTask(s.taskID) {
 			_ = st.UpdateTaskStatus(ctx(), s.taskID, store.StatusDone)
 		}
+	case "merge_clean":
+		m.status = "merged into base branch & cleaned up worktree"
+		_ = st.Emit(ctx(), store.EventMerged, map[string]any{"session": msg.sessionID})
+		if s := m.sessions[msg.sessionID]; s != nil && m.soleAgentForTask(s.taskID) {
+			_ = st.UpdateTaskStatus(ctx(), s.taskID, store.StatusDone)
+		}
+		delete(m.sessions, msg.sessionID)
 	case "discard":
 		m.status = "worktree discarded"
 		_ = st.Emit(ctx(), store.EventDiscarded, map[string]any{"session": msg.sessionID})
