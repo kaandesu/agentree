@@ -147,6 +147,67 @@ func TestIngestSplitReadsPlanAndSpawns(t *testing.T) {
 	}
 }
 
+// TestPrepareSplitNowSpawnsAgents drives the "split now" path: the raw spec is
+// split (stub brain → single sub-task) and a worktree + agent is provisioned
+// immediately, with no plan-mode session. The task lands in `running` and the
+// result carries project context (planSessionID 0, since there's no parent plan
+// session). Gated on git + tmux.
+func TestPrepareSplitNowSpawnsAgents(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if !orchestrator.TmuxAvailable() {
+		t.Skip("tmux not available")
+	}
+	c := context.Background()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	repo := initGitRepo(t)
+	proj, _ := st.CreateProject(ctx(), "demo", repo, "main")
+
+	tm := orchestrator.NewTmuxManager(fmt.Sprintf("agentree_splittest_%d", os.Getpid()))
+	t.Cleanup(func() { _ = tm.Kill(c) })
+	if err := tm.Ensure(c); err != nil {
+		t.Fatal(err)
+	}
+
+	m := Model{
+		store: st,
+		brain: brain.New(brain.OpenAI, "", ""), // stub → single sub-task
+		wt:    orchestrator.NewWorktreeManager(filepath.Join(dir, "worktrees")),
+		tmux:  tm,
+	}
+
+	msg, ok := m.prepareSplitCmd(launchPlanRequestMsg{
+		project: *proj, spec: "M4: do X\nM5: do Y", mode: "split",
+	})().(planSplitMsg)
+	if !ok {
+		t.Fatalf("expected planSplitMsg")
+	}
+	if msg.planSessionID != 0 {
+		t.Errorf("planSessionID = %d, want 0 (no parent plan session)", msg.planSessionID)
+	}
+	if len(msg.spawns) != 1 {
+		t.Fatalf("spawns = %d, want 1", len(msg.spawns))
+	}
+	if msg.repoPath != repo || msg.baseBranch != "main" {
+		t.Errorf("project context not carried: repo=%q base=%q", msg.repoPath, msg.baseBranch)
+	}
+	if _, err := os.Stat(msg.spawns[0].worktree); err != nil {
+		t.Errorf("worktree not created: %v", err)
+	}
+
+	got, _ := st.GetTask(ctx(), msg.planTaskID)
+	if got.Status != store.StatusRunning {
+		t.Errorf("task status = %q, want running", got.Status)
+	}
+}
+
 func mustListWindows(t *testing.T, tm *orchestrator.TmuxManager) []orchestrator.Window {
 	t.Helper()
 	ws, err := tm.ListWindows(context.Background())

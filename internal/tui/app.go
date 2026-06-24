@@ -7,6 +7,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"agentree/internal/brain"
@@ -18,6 +19,18 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// newTmuxManager selects the tmux driver. Normally agentree runs inside tmux (it
+// re-execs itself there at startup), so agents are spawned as panes beside the
+// dashboard. AGENTREE_OWNS_TMUX, set by that bootstrap, marks a server we
+// created (safe to set session-global options). When tmux can't be entered
+// (absent / non-TTY) we fall back to the standalone one-window-per-agent server.
+func newTmuxManager(cfg *config.Config) *orchestrator.TmuxManager {
+	if os.Getenv("TMUX") != "" {
+		return orchestrator.NewInheritedTmuxManager(os.Getenv("AGENTREE_OWNS_TMUX") == "1")
+	}
+	return orchestrator.NewTmuxManager(cfg.TmuxSocket)
+}
 
 type tabID int
 
@@ -47,7 +60,7 @@ type tab interface {
 	SetSize(w, h int)
 	// CapturingInput reports whether the tab is actively editing text, so the
 	// root should forward letter/number keys to it instead of treating them as
-	// global shortcuts. Tab navigation, Ctrl+I and Ctrl+C remain global.
+	// global shortcuts. Tab navigation, Ctrl+N and Ctrl+C remain global.
 	CapturingInput() bool
 }
 
@@ -58,6 +71,7 @@ type Model struct {
 	brain brain.Brain
 	wt    *orchestrator.WorktreeManager
 	tmux  *orchestrator.TmuxManager
+	ship  orchestrator.Shipper
 	keys  KeyMap
 	theme Theme
 
@@ -65,8 +79,9 @@ type Model struct {
 	active        tabID
 	tabs          [numTabs]tab
 
-	// modal overlays the active tab when non-nil (e.g. idea capture).
-	modal *ideaModal
+	// overlay covers the active tab when non-nil (idea capture, confirm prompt,
+	// help). It owns all input until it reports done.
+	overlay overlay
 
 	// sessions are running plan/agent tmux windows, keyed by id. lastSession is
 	// the most recent session; ctrl+o attaches to the tmux server (landing on
@@ -77,6 +92,9 @@ type Model struct {
 	// polling is true while a single planPollMsg tick-loop is live, so the
 	// several code paths that want polling don't spawn parallel loops.
 	polling bool
+	// superviseTick counts poll ticks so the supervisor runs every few ticks
+	// (its git diffs are heavier than a tmux list).
+	superviseTick int
 
 	status string
 	err    error
@@ -90,14 +108,21 @@ func New(cfg *config.Config, st *store.Store) Model {
 		store:    st,
 		brain:    brain.New(brain.Provider(cfg.BrainProvider), cfg.BrainModel, cfg.APIKey()),
 		wt:       orchestrator.NewWorktreeManager(cfg.WorktreeRoot),
-		tmux:     orchestrator.NewTmuxManager(cfg.TmuxSocket),
+		tmux:     newTmuxManager(cfg),
+		ship:     orchestrator.NewGitShipper(),
 		keys:     DefaultKeyMap(),
 		theme:    theme,
 		active:   tabDashboard,
 		sessions: map[int]*session{},
 		status:   "ready",
 	}
-	m.tabs[tabDashboard] = newDashboard(st, theme)
+	// Discover agentree's own tmux window up front (inherited mode) so agent
+	// panes can be split into it without a per-flow Ensure race. Best-effort:
+	// flows call Ensure again (idempotent) and surface any real error there.
+	if m.tmux.Inherited() {
+		_ = m.tmux.Ensure(context.Background())
+	}
+	m.tabs[tabDashboard] = newDashboard(st, theme, m.tmux.Inherited())
 	m.tabs[tabPlanner] = newPlanner(st, theme)
 	m.tabs[tabProjects] = newProjects(st, theme)
 	m.tabs[tabIdeas] = newIdeas(st, theme)
@@ -114,6 +139,28 @@ func (m Model) WithInitialProject(p store.Project) Model {
 	}
 	m.status = "project: " + p.Name
 	return m
+}
+
+// promoteIdea opens the Planner prefilled from an idea, marks the idea promoted,
+// and refreshes the Ideas tab. The eventual task carries the idea id (threaded
+// through launchPlanRequestMsg).
+func (m *Model) promoteIdea(idea store.Idea) (tea.Model, tea.Cmd) {
+	if pl, ok := m.tabs[tabPlanner].(*planner); ok {
+		pl.prefill(idea)
+	}
+	m.active = tabPlanner
+	m.status = "promoted idea to Planner: " + idea.Title
+	st := m.store
+	id := idea.ID
+	mark := func() tea.Msg {
+		_ = st.SetIdeaStatus(ctx(), id, "promoted")
+		items, err := st.ListIdeas(ctx())
+		if err != nil {
+			return errMsg{err}
+		}
+		return ideasLoadedMsg{items}
+	}
+	return *m, mark
 }
 
 // Init kicks off each tab's initial commands.
@@ -147,36 +194,39 @@ func (m *Model) resizeTabs() {
 
 // Update handles global keys first, then delegates to the modal or active tab.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+	if ws, ok := msg.(tea.WindowSizeMsg); ok {
+		m.width, m.height = ws.Width, ws.Height
 		m.resizeTabs()
-		if m.modal != nil {
-			m.modal.SetSize(m.width, m.height)
+		if m.overlay != nil {
+			m.overlay.SetSize(m.width, m.height)
 		}
 		return m, nil
+	}
 
-	case tea.KeyMsg:
-		// The modal, when open, captures all keys except a hard quit.
-		if m.modal != nil {
-			if key.Matches(msg, m.keys.Quit) && msg.String() == "ctrl+c" {
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			done, cmd := m.modal.Update(msg)
-			if done {
-				m.modal = nil
-			}
-			return m, cmd
+	// An overlay, when open, owns every message (keys, async triage, spinner
+	// ticks) except a hard quit, so its multi-phase flow isn't interrupted.
+	if m.overlay != nil {
+		if k, ok := msg.(tea.KeyMsg); ok && k.String() == "ctrl+c" {
+			return m, tea.Quit
 		}
+		done, cmd := m.overlay.Update(msg)
+		if done {
+			m.overlay = nil
+		}
+		return m, cmd
+	}
 
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
 		// Always-global keys (work even while a tab captures text).
 		switch {
 		case msg.String() == "ctrl+c":
 			return m, tea.Quit
 		case msg.String() == "ctrl+o":
-			// Hand the terminal to tmux to interact with live agents.
-			return m, m.attachCmd()
+			// Agents are live panes beside the dashboard. In tmux, ctrl+o moves
+			// focus to the next agent pane; in the standalone fallback it hands
+			// the terminal to tmux to attach.
+			return m, m.focusOrAttachCmd()
 		case key.Matches(msg, m.keys.NextTab):
 			m.active = (m.active + 1) % numTabs
 			return m, nil
@@ -184,15 +234,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.active = (m.active - 1 + numTabs) % numTabs
 			return m, nil
 		case key.Matches(msg, m.keys.CaptureIdea):
-			mod := newIdeaModal(m.store, m.theme)
+			mod := newIdeaModal(m.store, m.brain, m.theme)
 			mod.SetSize(m.width, m.height)
-			m.modal = &mod
-			return m, m.modal.Init()
+			m.overlay = &mod
+			return m, mod.Init()
 		}
 
 		// Letter/number shortcuts only when the active tab isn't editing text.
 		if !m.tabs[m.active].CapturingInput() {
 			switch {
+			case key.Matches(msg, m.keys.Help):
+				ho := newHelpOverlay(m.theme)
+				ho.SetSize(m.width, m.height)
+				m.overlay = &ho
+				return m, nil
 			case key.Matches(msg, m.keys.Quit):
 				return m, tea.Quit
 			case key.Matches(msg, m.keys.Tab1):
@@ -221,7 +276,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case ideaCapturedMsg:
 		m.status = "idea filed"
+	case statusMsg:
+		m.status = msg.text
+		return m, nil
+	case promoteIdeaMsg:
+		return (&m).promoteIdea(msg.idea)
 	case launchPlanRequestMsg:
+		if msg.mode == "split" {
+			return (&m).startSplitNow(msg)
+		}
 		return m, m.preparePlanCmd(msg)
 	case planPreparedMsg:
 		return (&m).startPlanSession(msg)
@@ -229,6 +292,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return (&m).handlePlanPoll()
 	case planSplitMsg:
 		return (&m).applyPlanSplit(msg)
+	case diffRequestMsg:
+		return (&m).handleDiffRequest(msg.sessionID)
+	case shipRequestMsg:
+		return (&m).handleShipRequest(msg.sessionID, msg.action)
+	case shipDoneMsg:
+		return (&m).handleShipDone(msg)
 	case attachReturnedMsg:
 		return (&m).handleAttachReturned()
 	case windowsMsg:
@@ -264,8 +333,8 @@ func (m Model) View() string {
 	tabBar := m.renderTabBar()
 
 	var content string
-	if m.modal != nil {
-		content = m.modal.View()
+	if m.overlay != nil {
+		content = m.overlay.View()
 	} else {
 		content = m.tabs[m.active].View()
 	}
@@ -291,7 +360,7 @@ func (m Model) renderTabBar() string {
 
 func (m Model) renderStatusBar() string {
 	left := m.theme.Accent.Render("agentree")
-	help := m.theme.Help.Render("tab: switch · ctrl+i: idea · q: quit · ?: help")
+	help := m.theme.Help.Render("tab: switch · ctrl+n: idea · q: quit · ?: help")
 	msg := m.status
 	if m.err != nil {
 		msg = "error: " + m.err.Error()

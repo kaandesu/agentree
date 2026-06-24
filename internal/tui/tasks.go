@@ -61,7 +61,7 @@ func (t *tasks) View() string {
 		b.WriteString(t.theme.Subtle.Render("No tasks yet."))
 	} else {
 		for _, it := range t.items {
-			b.WriteString(fmt.Sprintf("%s  [%s]  %s\n", statusDot(it.Status), it.AgentKind, it.Title))
+			b.WriteString(fmt.Sprintf("%s  [%s]  %s\n", statusDot(t.theme, it.Status), it.AgentKind, it.Title))
 		}
 	}
 	return lipgloss.NewStyle().Width(t.w).Height(t.h).Padding(1, 2).Render(b.String())

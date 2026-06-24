@@ -12,18 +12,24 @@ import (
 // attaches to interact and tab-cycles between them with tmux's own bindings.
 type session struct {
 	id       int
+	parentID int // plan session that spawned this agent; 0 for plan sessions
 	taskID   int64
 	title    string
 	kind     string // "plan" | "agent"
 	windowID string // tmux window id, e.g. "@3"
 	dir      string // repo path (plan) or worktree path (agent)
+	branch   string // agent branch (agentree/<slug>); empty for plan sessions
 
 	// Project info carried on plan sessions so the split step can provision a
-	// worktree per sub-task without re-reading the store.
+	// worktree per sub-task without re-reading the store. Agent sessions reuse
+	// repoPath/baseBranch so completion actions (PR/merge) need no store lookup.
 	projectID   int64
 	projectName string
 	repoPath    string
 	baseBranch  string
+
+	// exitedReported guards one-shot agent.exited event emission per session.
+	exitedReported bool
 
 	// Plan-artifact ingestion (plan sessions). We snapshot the global plans dir
 	// at launch and attribute any newer file to this session.

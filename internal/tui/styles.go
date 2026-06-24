@@ -17,6 +17,13 @@ type Theme struct {
 	Subtle      lipgloss.Style
 	Accent      lipgloss.Style
 	ModalBox    lipgloss.Style
+	// Semantic status styles (centralized so the look is consistent and
+	// retheming is a one-file change).
+	StatusOk   lipgloss.Style // running / healthy
+	StatusWarn lipgloss.Style // ready / review / attention
+	StatusErr  lipgloss.Style // errored exit
+	StatusIdle lipgloss.Style // done / exited cleanly / inactive
+	Tree       lipgloss.Style // tree connector glyphs
 }
 
 var (
@@ -26,6 +33,9 @@ var (
 	colBorder  = lipgloss.Color("238")
 	colBg      = lipgloss.Color("236")
 	colFgLight = lipgloss.Color("255")
+	colOk      = lipgloss.Color("82")  // green
+	colWarn    = lipgloss.Color("220") // yellow
+	colErr     = lipgloss.Color("196") // red
 )
 
 // NewTheme builds the default theme.
@@ -63,5 +73,10 @@ func NewTheme() Theme {
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colAccent).
 			Padding(1, 2),
+		StatusOk:   lipgloss.NewStyle().Foreground(colOk),
+		StatusWarn: lipgloss.NewStyle().Foreground(colWarn),
+		StatusErr:  lipgloss.NewStyle().Foreground(colErr),
+		StatusIdle: lipgloss.NewStyle().Foreground(colSubtle),
+		Tree:       lipgloss.NewStyle().Foreground(colBorder),
 	}
 }

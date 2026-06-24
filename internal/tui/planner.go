@@ -32,12 +32,21 @@ type planner struct {
 	selected *store.Project
 	ta       textarea.Model
 	notice   string
+
+	// pendingIdeaID links the next launched task back to a promoted idea.
+	pendingIdeaID *int64
 }
 
-// launchPlanRequestMsg asks the root to start a planning session.
+// launchPlanRequestMsg asks the root to start work on a spec. mode selects how:
+// "plan" opens claude in plan mode to interrogate + plan before splitting;
+// "split" fans the spec out into parallel worktree agents immediately (for a
+// spec the user has already decomposed). ideaID links the resulting task back to
+// a promoted idea (nil for specs typed from scratch).
 type launchPlanRequestMsg struct {
 	project store.Project
 	spec    string
+	mode    string // "plan" | "split"
+	ideaID  *int64
 }
 
 func newPlanner(st *store.Store, th Theme) *planner {
@@ -55,6 +64,26 @@ func (p *planner) selectProject(pr store.Project) {
 	p.selected = &pr
 	p.phase = phaseCompose
 	p.ta.Focus()
+}
+
+// prefill loads a promoted idea into the composer. If a project is already
+// selected it jumps straight to compose; otherwise the draft is held until the
+// user picks one. The idea id is carried onto the eventual task.
+func (p *planner) prefill(idea store.Idea) {
+	text := idea.Title
+	if strings.TrimSpace(idea.Body) != "" {
+		text += "\n\n" + idea.Body
+	}
+	p.ta.SetValue(text)
+	id := idea.ID
+	p.pendingIdeaID = &id
+	p.notice = "promoted idea — edit the spec, then ctrl+s to launch"
+	if p.selected != nil {
+		p.phase = phaseCompose
+		p.ta.Focus()
+	} else {
+		p.phase = phaseSelectProject
+	}
 }
 
 func (p *planner) refresh() tea.Cmd {
@@ -81,6 +110,7 @@ func (p *planner) Update(msg tea.Msg) (tab, tea.Cmd) {
 		p.ta.Reset()
 		p.phase = phaseSelectProject
 		p.selected = nil
+		p.pendingIdeaID = nil
 		return p, nil
 	case tea.KeyMsg:
 		if p.phase == phaseSelectProject {
@@ -124,13 +154,17 @@ func (p *planner) updateCompose(msg tea.KeyMsg) (tab, tea.Cmd) {
 		p.phase = phaseSelectProject
 		p.ta.Blur()
 		return p, nil
-	case "ctrl+s":
+	case "ctrl+s", "ctrl+f":
 		spec := strings.TrimSpace(p.ta.Value())
 		if spec == "" || p.selected == nil {
 			return p, nil
 		}
+		mode := "plan"
+		if msg.String() == "ctrl+f" {
+			mode = "split"
+		}
 		return p, func() tea.Msg {
-			return launchPlanRequestMsg{project: *p.selected, spec: spec}
+			return launchPlanRequestMsg{project: *p.selected, spec: spec, mode: mode, ideaID: p.pendingIdeaID}
 		}
 	}
 	var cmd tea.Cmd
@@ -178,7 +212,7 @@ func (p *planner) View() string {
 		b.WriteString("\n")
 		b.WriteString(p.ta.View())
 		b.WriteString("\n")
-		b.WriteString(p.theme.Help.Render("ctrl+s: expand & launch plan mode · esc: back"))
+		b.WriteString(p.theme.Help.Render("ctrl+s: plan first (interrogate) · ctrl+f: split now (fan out) · esc: back"))
 	}
 	return lipgloss.NewStyle().Width(p.w).Height(p.h).Padding(1, 2).Render(b.String())
 }

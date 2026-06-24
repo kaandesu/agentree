@@ -32,9 +32,12 @@ func DefaultKeyMap() KeyMap {
 		Tab3: key.NewBinding(key.WithKeys("3")),
 		Tab4: key.NewBinding(key.WithKeys("4")),
 		Tab5: key.NewBinding(key.WithKeys("5")),
+		// ctrl+i is byte 0x09 — identical to Tab in every standard terminal, so
+		// terminals deliver it as "tab" and it can never be told apart from the
+		// NextTab binding. Use ctrl+n ("new idea"), a key with its own code.
 		CaptureIdea: key.NewBinding(
-			key.WithKeys("ctrl+i"),
-			key.WithHelp("ctrl+i", "capture idea"),
+			key.WithKeys("ctrl+n"),
+			key.WithHelp("ctrl+n", "capture idea"),
 		),
 		Quit: key.NewBinding(
 			key.WithKeys("ctrl+c", "q"),
