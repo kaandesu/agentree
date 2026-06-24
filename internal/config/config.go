@@ -35,6 +35,11 @@ type Config struct {
 	// ~/.config/agentree/agentree.db.
 	DBPath string `toml:"db_path"`
 
+	// TmuxSocket is the dedicated tmux server socket agentree hosts agent
+	// windows on (tmux -L <socket>). A private socket isolates agentree's
+	// windows from the user's normal tmux server. Default: agentree.
+	TmuxSocket string `toml:"tmux_socket"`
+
 	// path is where this config was loaded from (not serialized).
 	path string `toml:"-"`
 }
@@ -79,6 +84,7 @@ func Load() (*Config, error) {
 		BrainModel:    "gpt-4o",
 		WorktreeRoot:  wtRoot,
 		DBPath:        filepath.Join(dir, "agentree.db"),
+		TmuxSocket:    "agentree",
 		path:          path,
 	}
 
