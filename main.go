@@ -45,6 +45,15 @@ func run() error {
 		return tui.RunSpike(args)
 	}
 
+	// Load .env files so a dropped-in OPENAI_API_KEY / ANTHROPIC_API_KEY is picked
+	// up without the user having to export it. Real environment variables always
+	// win (loadDotenv never overwrites a var that's already set). Checked: the
+	// current working directory, then ~/.config/agentree/.env.
+	loadDotenv(".env")
+	if home, err := os.UserHomeDir(); err == nil {
+		loadDotenv(filepath.Join(home, ".config", "agentree", ".env"))
+	}
+
 	// agentree is an agent multiplexer: it shows its own dashboard beside the
 	// agent panes it spawns. For that it must itself be a tmux pane, so when
 	// launched from a plain terminal we re-exec inside a fresh tmux session
@@ -121,6 +130,41 @@ func bootstrapTmux() error {
 	// Replace this process with tmux; the child agentree inherits a set $TMUX and
 	// skips this bootstrap.
 	return syscall.Exec(tmuxPath, argv, env)
+}
+
+// loadDotenv reads a simple KEY=VALUE .env file and sets each var via os.Setenv,
+// but never overwrites a variable already present in the environment (so an
+// explicit export wins). Missing files are ignored. It tolerates blank lines,
+// `#` comments, a leading `export `, and single/double-quoted values.
+func loadDotenv(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, val)
+		}
+	}
 }
 
 // isTerminal reports whether f is a character device (a TTY), used to avoid

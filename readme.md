@@ -39,7 +39,7 @@ Agentree is a Go TUI that runs inside `tmux`, tracks projects and tasks in SQLit
 ## Install
 
 ```sh
-git clone <repo-url>
+git clone https://github.com/kaandesu/agentree
 cd agentree
 go mod download
 go build -o agentree .
@@ -68,11 +68,11 @@ export OPENAI_API_KEY="sk-..."
 
 Supported variables:
 
-| Variable | Required | Notes |
-| --- | --- | --- |
-| `OPENAI_API_KEY` | Recommended | Used by the default `openai` brain provider. |
-| `ANTHROPIC_API_KEY` | Optional | Used only if `brain_provider` is set to `anthropic`. |
-| `AGENTREE_OWNS_TMUX` | Internal | Set by Agentree when it bootstraps its own tmux session. You do not need to set it. |
+| Variable             | Required    | Notes                                                                               |
+| -------------------- | ----------- | ----------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`     | Recommended | Used by the default `openai` brain provider.                                        |
+| `ANTHROPIC_API_KEY`  | Optional    | Used only if `brain_provider` is set to `anthropic`.                                |
+| `AGENTREE_OWNS_TMUX` | Internal    | Set by Agentree when it bootstraps its own tmux session. You do not need to set it. |
 
 Agentree does not require a `.env` loader at runtime, so export variables in your shell, terminal profile, or process manager.
 
@@ -96,13 +96,13 @@ tmux_socket = "agentree"
 
 Config keys:
 
-| Key | Default | Purpose |
-| --- | --- | --- |
-| `brain_provider` | `openai` | LLM provider used for triage and planning. |
-| `brain_model` | `gpt-4o` | Model name sent to the configured provider. |
-| `worktree_root` | `~/.agentree/worktrees` | Parent directory for per-task worktrees. |
-| `db_path` | `~/.config/agentree/agentree.db` | SQLite database path. |
-| `tmux_socket` | `agentree` | Dedicated tmux socket name. |
+| Key              | Default                          | Purpose                                     |
+| ---------------- | -------------------------------- | ------------------------------------------- |
+| `brain_provider` | `openai`                         | LLM provider used for triage and planning.  |
+| `brain_model`    | `gpt-4o`                         | Model name sent to the configured provider. |
+| `worktree_root`  | `~/.agentree/worktrees`          | Parent directory for per-task worktrees.    |
+| `db_path`        | `~/.config/agentree/agentree.db` | SQLite database path.                       |
+| `tmux_socket`    | `agentree`                       | Dedicated tmux socket name.                 |
 
 ## Usage
 
