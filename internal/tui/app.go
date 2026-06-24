@@ -57,6 +57,7 @@ type Model struct {
 	store *store.Store
 	brain brain.Brain
 	wt    *orchestrator.WorktreeManager
+	tmux  *orchestrator.TmuxManager
 	keys  KeyMap
 	theme Theme
 
@@ -67,13 +68,15 @@ type Model struct {
 	// modal overlays the active tab when non-nil (e.g. idea capture).
 	modal *ideaModal
 
-	// sessions are running plan/agent panes, keyed by id. viewing is the
-	// session shown fullscreen (0 = show tabs). lastSession is the most recent
-	// session, used by ctrl+o to re-attach.
+	// sessions are running plan/agent tmux windows, keyed by id. lastSession is
+	// the most recent session; ctrl+o attaches to the tmux server (landing on
+	// it) so the user can interact and tab-cycle between agents.
 	sessions    map[int]*session
-	viewing     int
 	lastSession int
 	nextSessID  int
+	// polling is true while a single planPollMsg tick-loop is live, so the
+	// several code paths that want polling don't spawn parallel loops.
+	polling bool
 
 	status string
 	err    error
@@ -87,6 +90,7 @@ func New(cfg *config.Config, st *store.Store) Model {
 		store:    st,
 		brain:    brain.New(brain.Provider(cfg.BrainProvider), cfg.BrainModel, cfg.APIKey()),
 		wt:       orchestrator.NewWorktreeManager(cfg.WorktreeRoot),
+		tmux:     orchestrator.NewTmuxManager(cfg.TmuxSocket),
 		keys:     DefaultKeyMap(),
 		theme:    theme,
 		active:   tabDashboard,
@@ -150,11 +154,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.modal != nil {
 			m.modal.SetSize(m.width, m.height)
 		}
-		for _, s := range m.sessions {
-			if s.pane != nil {
-				s.pane.SetSize(m.width, m.paneHeight())
-			}
-		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -171,34 +170,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
-		// Session view: forward keys to the focused pane; ctrl+b detaches.
-		if m.viewing != 0 {
-			switch msg.String() {
-			case "ctrl+c":
-				return m, tea.Quit
-			case "ctrl+b":
-				m.viewing = 0
-				return m, nil
-			}
-			if s := m.sessions[m.viewing]; s != nil && s.pane != nil {
-				_, cmd := s.pane.Update(msg)
-				return m, cmd
-			}
-			return m, nil
-		}
-
 		// Always-global keys (work even while a tab captures text).
 		switch {
 		case msg.String() == "ctrl+c":
 			return m, tea.Quit
 		case msg.String() == "ctrl+o":
-			if m.lastSession != 0 && m.sessions[m.lastSession] != nil {
-				m.viewing = m.lastSession
-				if s := m.sessions[m.viewing]; s.pane != nil {
-					s.pane.SetSize(m.width, m.paneHeight())
-				}
-			}
-			return m, nil
+			// Hand the terminal to tmux to interact with live agents.
+			return m, m.attachCmd()
 		case key.Matches(msg, m.keys.NextTab):
 			m.active = (m.active + 1) % numTabs
 			return m, nil
@@ -243,20 +221,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case ideaCapturedMsg:
 		m.status = "idea filed"
-	case paneDirtyMsg:
-		if s := m.sessions[msg.id]; s != nil && s.pane != nil {
-			_, cmd := s.pane.Update(msg)
-			return m, cmd
-		}
-		return m, nil
-	case paneExitedMsg:
-		return (&m).handlePaneExited(msg)
 	case launchPlanRequestMsg:
 		return m, m.preparePlanCmd(msg)
 	case planPreparedMsg:
 		return (&m).startPlanSession(msg)
 	case planPollMsg:
 		return (&m).handlePlanPoll()
+	case planSplitMsg:
+		return (&m).applyPlanSplit(msg)
+	case attachReturnedMsg:
+		return (&m).handleAttachReturned()
+	case windowsMsg:
+		// Broadcast below so the dashboard can render the live window list.
 	}
 
 	// Key messages go only to the active tab; everything else (async loads,
@@ -278,27 +254,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View renders tab bar + active tab content (or modal) + status bar. When a
-// session is attached (viewing != 0) it takes over the screen.
+// View renders tab bar + active tab content (or modal) + status bar. Live
+// agents run in tmux; the user attaches (ctrl+o) to interact with them.
 func (m Model) View() string {
 	if m.width == 0 {
 		return "loading…"
-	}
-
-	if m.viewing != 0 {
-		if s := m.sessions[m.viewing]; s != nil && s.pane != nil {
-			exited := ""
-			if s.exited {
-				exited = m.theme.Subtle.Render(" (exited)")
-			}
-			bar := m.theme.StatusBar.Width(m.width).Render(
-				fmt.Sprintf(" %s %s%s  %s",
-					m.theme.Accent.Render("◆ session"),
-					s.title, exited,
-					m.theme.Help.Render("ctrl+b: detach · ctrl+c: quit")))
-			return lipgloss.JoinVertical(lipgloss.Left, s.pane.View(), bar)
-		}
-		m.viewing = 0 // session vanished; fall back to tabs
 	}
 
 	tabBar := m.renderTabBar()
@@ -348,11 +308,11 @@ func (m Model) renderStatusBar() string {
 	return m.theme.StatusBar.Width(m.width).Render(line + strings.Repeat(" ", gap) + help)
 }
 
-// liveSessionCount counts sessions whose pane has not exited.
+// liveSessionCount counts sessions whose tmux window is still running.
 func (m Model) liveSessionCount() int {
 	n := 0
 	for _, s := range m.sessions {
-		if !s.exited {
+		if !s.dead {
 			n++
 		}
 	}

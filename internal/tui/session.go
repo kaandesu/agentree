@@ -2,32 +2,39 @@ package tui
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
-
-	"agentree/internal/orchestrator"
 )
 
-// session is a running agent/plan pane tied to a task. Multiple sessions run
-// concurrently; the root model owns them and shows one fullscreen at a time.
+// session is a running plan/agent tied to a task, backed by a tmux window.
+// Multiple sessions run concurrently in agentree's tmux session; the user
+// attaches to interact and tab-cycles between them with tmux's own bindings.
 type session struct {
 	id       int
 	taskID   int64
 	title    string
 	kind     string // "plan" | "agent"
-	pane     *paneModel
-	worktree string
+	windowID string // tmux window id, e.g. "@3"
+	dir      string // repo path (plan) or worktree path (agent)
 
-	// Plan-artifact ingestion (best-effort). We snapshot the global plans dir
-	// at launch and, on session exit, attribute any newer file to this session.
+	// Project info carried on plan sessions so the split step can provision a
+	// worktree per sub-task without re-reading the store.
+	projectID   int64
+	projectName string
+	repoPath    string
+	baseBranch  string
+
+	// Plan-artifact ingestion (plan sessions). We snapshot the global plans dir
+	// at launch and attribute any newer file to this session.
 	plansDir string
 	snapshot map[string]bool
 	launchAt time.Time
 	planPath string // discovered plan file
-	exited   bool
-	ingested bool
+
+	dead      bool // tmux window's command exited
+	splitting bool // an ingest+split command is in flight
+	ingested  bool // plan captured and split kicked off (terminal for plan)
 }
 
 // plansDir returns ~/.claude/plans, where Claude Code persists plan files.
@@ -86,19 +93,16 @@ func findNewPlan(dir string, snapshot map[string]bool, launchAt time.Time) strin
 	return cands[0].path
 }
 
-// startAgentPane launches argv on a PTY in dir and wraps it as a pane.
-func startAgentPane(id int, dir string, argv []string, w, h int) (*paneModel, error) {
-	start := func(onUpdate func(), cols, rows int) (*orchestrator.Pane, error) {
-		c := exec.Command(argv[0], argv[1:]...)
-		c.Dir = dir
-		c.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
-		return orchestrator.StartPane(c, cols, rows, onUpdate)
-	}
-	return newPaneModel(id, start, w, h)
-}
-
 // claudePlanArgv builds the command to launch claude in interactive plan mode
-// seeded with the expanded prompt.
+// seeded with the expanded prompt. Plan mode is read-only, so it's safe to run
+// directly in the repo (no worktree needed until the plan is split).
 func claudePlanArgv(prompt string) []string {
 	return []string{"claude", prompt, "--permission-mode", "plan"}
+}
+
+// claudeBuildArgv launches claude to autonomously build a sub-task inside its
+// worktree. acceptEdits lets it apply file changes without prompting on every
+// edit; the user can attach to handle anything it escalates.
+func claudeBuildArgv(prompt string) []string {
+	return []string{"claude", prompt, "--permission-mode", "acceptEdits"}
 }
