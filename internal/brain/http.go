@@ -42,6 +42,24 @@ func (b *httpBrain) TriageIdea(ctx context.Context, title, body string) (Triage,
 	return parseTriage(out)
 }
 
+func (b *httpBrain) SplitPlan(ctx context.Context, plan string) ([]SubTask, error) {
+	out, err := b.chat(ctx, splitSystemPrompt, plan, 4096)
+	if err != nil {
+		// Fail soft: build the whole plan as a single sub-task rather than nothing.
+		return []SubTask{singleSubTask(plan)}, err
+	}
+	subs, perr := parseSplit(out)
+	if perr != nil {
+		return []SubTask{singleSubTask(plan)}, perr
+	}
+	// Frame each self-contained slice with the agent operating context, so
+	// callers can launch SubTask.Prompt verbatim.
+	for i := range subs {
+		subs[i].Prompt = wrapBuildPrompt(subs[i].Prompt)
+	}
+	return subs, nil
+}
+
 // chat dispatches to the configured provider and returns the assistant text.
 func (b *httpBrain) chat(ctx context.Context, system, user string, maxTokens int) (string, error) {
 	switch b.provider {
